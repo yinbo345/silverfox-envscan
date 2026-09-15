@@ -1,0 +1,5 @@
+#define IDI_SHIELD 101
+IDI_SHIELD ICON "D:\\silverfox-envscan\\shield.ico"
+// 说明：VersionInfo 版本资源由构建脚本在编译后用 update_ver.exe 注入
+// （BeginUpdateResource/UpdateResource 系统 API，规避 cvtres 对 RT_VERSION 的目录树合并问题）。
+// 顺序：cl 编译 → update_ver 注入版本 → signtool 签名 → NSIS 打包。
