@@ -2,7 +2,7 @@
 
 银狐防护的**系统级防线**：浏览器扩展管网页，主防程序管系统。这是一款独立的 Windows 主防程序——后台以 Windows 服务常驻（`SilverFoxGuardSvc.exe`），自带 WebView2 通知窗口、托盘式图形主界面，并经 Native Messaging 私有管道与[浏览器扩展](https://github.com/yinbo345/silverfox-guard)联动。
 
-当前以**预览版2**形态发布，安装包可从[官网](https://silverfoxguard.dpdns.org/)下载。
+当前以 **preview2** 形态发布，安装包可从[官网](https://silverfoxguard.dpdns.org/)下载。
 
 ## 它防什么
 
