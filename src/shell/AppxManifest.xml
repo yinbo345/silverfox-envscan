@@ -1,0 +1,45 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- 银狐主防 · Win11 右键一级菜单稀疏包清单
+     与 src/shell/SilverFoxShell.cpp 的 CLSID 保持一致。
+     注册：Add-AppxPackage -Path AppxManifest.xml -Register -ExternalLocation <dll目录>（需开发者模式） -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+         xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+         xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+         IgnorableNamespaces="uap uap10">
+  <Identity Name="Yinbo345.SilverFoxShell"
+            Publisher="CN=SilverFox, O=SilverFox"
+            Version="1.0.0.0" />
+  <Properties>
+    <DisplayName>SilverFoxShell</DisplayName>
+    <PublisherDisplayName>SilverFox</PublisherDisplayName>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Extensions>
+    <!-- 一级右键菜单 verb -->
+    <desktop4:Extension Category="windows.fileExplorerContextMenus">
+      <desktop4:FileExplorerContextMenus>
+        <desktop5:ItemType Type="*">
+          <!-- Id 用 0000 前缀：规避 Win11 对「经典菜单排序靠后 verb 漏捞」的已知问题 -->
+          <desktop5:Verb Id="0000SilverFoxProbe"
+                        Clsid="{860B45D8-4E6A-4F29-9A5C-7D0E3A1F8B42}" />
+        </desktop5:ItemType>
+      </desktop4:FileExplorerContextMenus>
+    </desktop4:Extension>
+    <!-- 托管 IExplorerCommand 的 COM 服务器（dllhost 代理加载，不注入 explorer） -->
+    <com:Extension Category="windows.comServer">
+      <com:ComServer>
+        <com:SurrogateServer DisplayName="SilverFoxShellComServer">
+          <com:Class Id="{860B45D8-4E6A-4F29-9A5C-7D0E3A1F8B42}"
+                     Path="SilverFoxShell.dll"
+                     ThreadingModel="STA" />
+        </com:SurrogateServer>
+      </com:ComServer>
+    </com:Extension>
+  </Extensions>
+</Package>

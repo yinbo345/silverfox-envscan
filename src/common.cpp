@@ -1,4 +1,4 @@
-// common.cpp — 银狐环境检测程序共享基础实现
+﻿// common.cpp — 银狐主防程序共享基础实现
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
@@ -13,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cstdio>
 #include <Wtsapi32.h>
 
 #include "common.h"
@@ -24,29 +25,69 @@
 
 namespace sf {
 
-const wchar_t* SVC_NAME     = L"SilverFoxEnvScanSvc";
-const wchar_t* SVC_DISPLAY  = L"银狐环境检测服务";
-const wchar_t* PIPE_NAME    = L"\\\\.\\pipe\\SilverFoxEnvScan";
-const char*    NM_HOST_NAME = "com.silverfox.envscan";
-const char*    CFG_ROOT     = "SOFTWARE\\SilverFoxEnvScan";
+const wchar_t* SVC_NAME     = L"SilverFoxGuardSvc";
+const wchar_t* SVC_DISPLAY  = L"银狐主防服务";
+const wchar_t* PIPE_NAME    = L"\\\\.\\pipe\\SilverFoxGuard";
+const char*    NM_HOST_NAME = "com.silverfox.guard";
+const char*    CFG_ROOT     = "SOFTWARE\\SilverFoxGuard";
 
-// 调试日志：统一写到 C:\ProgramData\SilverFoxEnvScan\envscan.log（VM 可访问）
+// 调试日志：统一写到 C:\ProgramData\SilverFoxGuard\guard.log（VM 可访问）
 void LogDbg(const std::string& msg) {
     wchar_t p[MAX_PATH] = {0};
     std::wstring dir;
     if (SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, p) == S_OK)
-        dir = std::wstring(p) + L"\\SilverFoxEnvScan";
-    else dir = L"C:\\ProgramData\\SilverFoxEnvScan";
+        dir = std::wstring(p) + L"\\SilverFoxGuard";
+    else dir = L"C:\\ProgramData\\SilverFoxGuard";
     CreateDirectoryW(dir.c_str(), nullptr);
-    std::wstring path = dir + L"\\envscan.log";
+    std::wstring path = dir + L"\\guard.log";
     HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (hf == INVALID_HANDLE_VALUE) return;
     SetFilePointer(hf, 0, nullptr, FILE_END);
     int n = MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, nullptr, 0);
     std::wstring w; w.resize(n); MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, &w[0], n);
     if (!w.empty() && w.back() == L'\0') w.pop_back();
-    std::wstring line = w + L"\r\n";
+    // 时间戳前缀：安全产品必须能回答「这个事件是什么时候发生的」——
+    // MTTD（平均检测时间）统计、攻击时间线复盘、以及"从落地到发现隔了多久"全部依赖它。
+    // 此前日志只有内容没有时间，导致任何审计与复盘都无从谈起。
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t ts[48];
+    swprintf_s(ts, L"[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    std::wstring line = std::wstring(ts) + w + L"\r\n";
     DWORD wn = 0; WriteFile(hf, line.c_str(), (DWORD)(line.size() * sizeof(wchar_t)), &wn, nullptr);
+    CloseHandle(hf);
+}
+
+// 纯 C 版日志（见 common.h）。实现刻意不依赖 std::string / std::wstring，
+// 只用栈上定长缓冲 —— 这样它可以在 __except 块内被调用而不触发 MSVC 的
+// C2712「无法在需要对象展开的函数中使用 __try」。
+void LogDbgC(const char* msg) {
+    if (!msg) return;
+    wchar_t dir[MAX_PATH] = {0};
+    if (SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, dir) != S_OK)
+        wcscpy_s(dir, L"C:\\ProgramData");
+    wcscat_s(dir, L"\\SilverFoxGuard");
+    CreateDirectoryW(dir, nullptr);
+
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\guard.log", dir);
+    HANDLE hf = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            OPEN_ALWAYS, 0, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(hf, 0, nullptr, FILE_END);
+
+    // 时间戳 + 正文，全部在栈上拼装（单行上限 1024 字符，足够容纳异常描述）
+    wchar_t line[1024];
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t body[768] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, msg, -1, body, 767);
+    int n = swprintf_s(line, L"[%04d-%02d-%02d %02d:%02d:%02d.%03d] %s\r\n",
+                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                       st.wSecond, st.wMilliseconds, body);
+    if (n > 0) {
+        DWORD wn = 0;
+        WriteFile(hf, line, (DWORD)(n * sizeof(wchar_t)), &wn, nullptr);
+    }
     CloseHandle(hf);
 }
 
@@ -190,7 +231,6 @@ std::string BuildResultJson(const ScanResult& r) {
     s += "\"score\":" + std::to_string(r.score) + ",";
     s += "\"engine\":" + JsonString(r.engine) + ",";
     s += "\"timestamp\":" + JsonString(r.timestamp) + ",";
-    s += "\"selfCheck\":" + std::string(r.selfCheck ? "true" : "false") + ",";
     s += "\"hardProof\":" + std::string(r.hardProof ? "true" : "false") + ",";
     s += "\"count\":" + std::to_string(r.findings.size()) + ",";
     s += "\"truncated\":";
@@ -235,9 +275,20 @@ bool ReadFramed(HANDLE h, std::string& out) {
     unsigned char hdr[4] = {0,0,0,0};
     DWORD r = 0;
     // 读取 4 字节长度头（循环确保读满）
+    // ★ 2026-09-19 修复「GUI 一直等不到回帧」：管道是 PIPE_READMODE_MESSAGE，
+    //   Electron 等客户端把「4字节头+JSON」一次性写入 = 一条消息。读前 4 字节时
+    //   ReadFile 返回 FALSE + ERROR_MORE_DATA(234)（消息还有剩余），旧代码当成
+    //   读失败直接 return false → 连接线程退出、不回帧不关句柄 → 客户端永远等待，
+    //   且每请求泄漏一个管道实例（MAX_INSTANCES=8 很快耗尽）。
+    //   正解：ERROR_MORE_DATA 时已读部分有效，继续循环读满；消息剩余部分由下一次
+    //   ReadFile 继续吐出（message 模式语义），两种客户端写法都兼容。
     DWORD got = 0;
     while (got < 4) {
-        if (!ReadFile(h, hdr + got, 4 - got, &r, nullptr) || r == 0) return false;
+        if (!ReadFile(h, hdr + got, 4 - got, &r, nullptr)) {
+            if (GetLastError() == ERROR_MORE_DATA && r > 0) { got += r; continue; }
+            return false;
+        }
+        if (r == 0) return false;
         got += r;
     }
     uint32_t len = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) | ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
@@ -246,7 +297,11 @@ bool ReadFramed(HANDLE h, std::string& out) {
     out.resize(len);
     got = 0;
     while (got < len) {
-        if (!ReadFile(h, &out[got], len - got, &r, nullptr) || r == 0) return false;
+        if (!ReadFile(h, &out[got], len - got, &r, nullptr)) {
+            if (GetLastError() == ERROR_MORE_DATA && r > 0) { got += r; continue; }
+            return false;
+        }
+        if (r == 0) return false;
         got += r;
     }
     return true;
@@ -273,14 +328,14 @@ bool WriteNmManifest(const std::string& hostExePath,
                      const std::string& extIdEdge,
                      std::string& outManifestPath) {
     std::string dir = DirName(hostExePath);
-    outManifestPath = dir + "\\com.silverfox.envscan.json";
+    outManifestPath = dir + "\\com.silverfox.guard.json";
     std::string chrome = extIdChrome.empty() ? extIdEdge : extIdChrome;
     std::string edge   = extIdEdge.empty()   ? extIdChrome : extIdEdge;
     if (chrome.empty()) chrome = "<EXTENSION_ID>";  // 占位（安装时应传入真实 ID）
     std::string json;
     json += "{\n";
     json += "  \"name\": \"" + std::string(NM_HOST_NAME) + "\",\n";
-    json += "  \"description\": \"银狐环境检测原生消息宿主\",\n";
+    json += "  \"description\": \"银狐主防原生消息宿主\",\n";
     json += "  \"path\": \"" + JsonEscape(hostExePath) + "\",\n";
     json += "  \"type\": \"stdio\",\n";
     json += "  \"allowed_origins\": [\n";

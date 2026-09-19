@@ -1,4 +1,4 @@
-// toast.cpp — 右下角 WebView2 通知（自带完整固定版本运行时，不依赖系统 Edge）
+﻿// toast.cpp — 右下角 WebView2 通知（自带完整固定版本运行时，不依赖系统 Edge）
 //
 // 渲染/动画修复要点：
 //   ① 窗口先创建在屏幕外（仍属「可见」状态，WebView2 的 put_Bounds / navdone 照常触发），
@@ -44,6 +44,15 @@
 
 using namespace Microsoft::WRL;
 
+// ---- 前置声明：单文件查杀卡片（实现见文件尾 sf 段）----
+namespace sf {
+std::wstring BuildProbeHtml(int level, int score, const std::string& type, const std::string& title,
+                            const std::wstring& fileW, const std::string& hitsRaw);
+std::wstring BuildProbeCleanHtml(const std::string& cleanResp, const std::wstring& pathW);
+std::wstring BuildUndoResultHtml(const std::string& undoResp);   // 撤销结果卡（勒索回滚场景）
+std::wstring BuildBootResultHtml(const std::string& resp,        // 引导扇区操作结果卡（恢复/信任）
+                                 const std::wstring& okTitle, const std::wstring& okSub);
+}
 namespace {
 
 HWND g_hwnd = nullptr;
@@ -63,14 +72,20 @@ bool g_cleanOk = false;         // 清除请求是否成功往返服务
 bool g_advStage = false;        // 当前是否处于「高级删除」阶段（普通删除未删完 → 升级）
 std::string g_currentStatus;    // 当前告警卡状态（确认卡取消后返回此状态渲染）
 int  g_currentScore = 0;        // 当前告警卡评分
+// ---- 勒索回滚场景的上下文（由 --risk / --undo / --rolledback 传入）----
+std::wstring g_risk;            // L"high" | L"suspect" | 空（普通扫描告警）
+std::string  g_undoToken;       // 撤销凭据（ANSI，仅 [0-9a-f]，已白名单过滤）
+bool         g_rolledBack = false;  // 本次是否真的发生过覆盖写
 int  g_resDeleted = 0, g_resDeferred = 0, g_resFailed = 0, g_resKilled = 0, g_resExtraDll = 0;
 // 普通删除阶段的结果快照（高级删除完成后，最终结果卡显示 普通+高级 的合并数字）
 int  g_normDeleted = 0, g_normDeferred = 0, g_normFailed = 0, g_normKilled = 0, g_normExtraDll = 0;
 int  g_lastPct = -1;            // 上次渲染的进度百分比（避免重复刷 DOM）
 std::wstring g_lastPhase;       // 上次渲染的阶段（避免重复刷 DOM）
 long g_lastHr = 0;             // 最近一次 WebView2 初始化 HRESULT（调试用）
+std::wstring g_probePath;             // 右键查杀：被查杀文件宽路径
+std::wstring g_probeIn;               // 右键查杀：输入路径（显示用）
 int g_posX = 0, g_posY = 0, g_w = 0, g_h = 0;  // 最终停靠位置/尺寸（屏幕外生成，navdone 后滑入）
-std::wstring g_logPath;   // 调试日志路径（懒初始化，指向 C:\ProgramData\SilverFoxEnvScan\envscan.log）
+std::wstring g_logPath;   // 调试日志路径（懒初始化，指向 C:\ProgramData\SilverFoxGuard\guard.log）
 std::mutex    g_logMtx;
 
 // 判断目录是否可用：能创建，或已存在，即视为可写
@@ -79,7 +94,7 @@ static bool DirUsable(const std::wstring& d) {
     return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
-// WebView2 userData 根目录（含 SilverFoxEnvScan 段）。要求【绝对路径】+【实测可写】：
+// WebView2 userData 根目录（含 SilverFoxGuard 段）。要求【绝对路径】+【实测可写】：
 // 服务经 CreateProcessAsUser 拉起的进程里存在两个坑：① SHGetFolderPathW(CSIDL_LOCAL_APPDATA) 可能失败；
 // ② 若未传用户环境块，%LOCALAPPDATA% 仍是服务（LocalSystem）的值
 // （C:\Windows\system32\config\systemprofile\AppData\Local），对以用户身份运行的进程既无权限也建不出
@@ -88,7 +103,7 @@ static bool DirUsable(const std::wstring& d) {
 static std::wstring Wv2BaseDir() {
     auto tryDir = [](const std::wstring& base) -> std::wstring {
         if (base.empty()) return L"";
-        std::wstring d = base + L"\\SilverFoxEnvScan";
+        std::wstring d = base + L"\\SilverFoxGuard";
         return DirUsable(d) ? d : L"";
     };
     wchar_t p[MAX_PATH] = {0};
@@ -111,19 +126,19 @@ static std::wstring Wv2BaseDir() {
         std::wstring d = tryDir(cp);
         if (!d.empty()) return d;
     }
-    CreateDirectoryW(L"C:\\ProgramData\\SilverFoxEnvScan", nullptr);
-    return L"C:\\ProgramData\\SilverFoxEnvScan";
+    CreateDirectoryW(L"C:\\ProgramData\\SilverFoxGuard", nullptr);
+    return L"C:\\ProgramData\\SilverFoxGuard";
 }
 
-// 调试日志统一写到 C:\ProgramData\SilverFoxEnvScan\envscan.log，确保 VM 也可访问与回捞
+// 调试日志统一写到 C:\ProgramData\SilverFoxGuard\guard.log，确保 VM 也可访问与回捞
 static std::wstring GetLogPath() {
     wchar_t p[MAX_PATH] = {0};
     std::wstring dir;
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, p)) && p[0])
-        dir = std::wstring(p) + L"\\SilverFoxEnvScan";
-    else dir = L"C:\\ProgramData\\SilverFoxEnvScan";
+        dir = std::wstring(p) + L"\\SilverFoxGuard";
+    else dir = L"C:\\ProgramData\\SilverFoxGuard";
     CreateDirectoryW(dir.c_str(), nullptr);
-    return dir + L"\\envscan.log";
+    return dir + L"\\guard.log";
 }
 
 void WriteDbg(const std::wstring& s) {
@@ -193,6 +208,50 @@ std::wstring GetSystemTheme() {
 
 // 获取工作区（屏幕减任务栏）右下角停靠坐标：弹窗贴任务栏上方，绝不覆盖任务栏。
 // GetDesktopWindow 返回的是整个屏幕（含任务栏），用它定位会盖住任务栏，故一律改用 SPI_GETWORKAREA。
+// ---- 单文件查杀：窄/宽互转 与 服务管道请求 ----
+static std::string W2U8(const std::wstring& w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return "";
+    std::string u(n - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &u[0], n, nullptr, nullptr);
+    return u;
+}
+static std::string ProbePipeRequest(const std::string& cmdJson) {
+    std::string resp;
+    HANDLE pipe = CreateFileW(sf::PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    for (int i = 0; i < 20 && pipe == INVALID_HANDLE_VALUE; ++i) {
+        Sleep(150);
+        pipe = CreateFileW(sf::PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    }
+    if (pipe == INVALID_HANDLE_VALUE) return resp;
+    sf::WriteFramed(pipe, cmdJson);
+    sf::ReadFramed(pipe, resp);
+    CloseHandle(pipe);
+    return resp;
+}
+static std::string ProbeVerdictRequest(const std::wstring& path) {
+    return ProbePipeRequest("{\"cmd\":\"probe\",\"path\":\"" + sf::JsonEscape(W2U8(path)) + "\"}");
+}
+static std::string ProbeCleanRequest(const std::wstring& path) {
+    return ProbePipeRequest("{\"cmd\":\"probeclean\",\"path\":\"" + sf::JsonEscape(W2U8(path)) + "\"}");
+}
+// 撤销最近一次自动回滚：把 token 交给服务，服务调 rb::UndoLastRollback。
+static std::string UndoPipeRequest(const std::string& token) {
+    return ProbePipeRequest("{\"cmd\":\"rollbackundo\",\"token\":\"" + sf::JsonEscape(token) + "\"}");
+}
+// 从响应里原样抠出 "hits":[...] 数组段（普通查找平衡）
+static std::string ExtractHitsRaw(const std::string& resp) {
+    size_t hb = resp.find("\"hits\":[");
+    if (hb == std::string::npos) return "[]";
+    size_t ob = hb + 7, i = ob;
+    int depth = 0;
+    for (; i < resp.size(); ++i) {
+        if (resp[i] == '{' || resp[i] == '[') ++depth;
+        else if (resp[i] == '}' || resp[i] == ']') { --depth; if (depth == 0) { ++i; break; } }
+    }
+    return resp.substr(ob, i - ob);
+}
+
 void GetDockPos(int& x, int& y, int w, int h, int margin) {
     RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     x = wa.right - w - margin;
@@ -208,8 +267,8 @@ void FallbackMessage() {
     WriteDbg(buf);
     // 关键：不先 DestroyWindow 再 MessageBox。先 DestroyWindow 会触发 WM_DESTROY→PostQuitMessage，
     // 干扰 MessageBox 显示（表现即「只有系统警告音、看不到框」）。改为先弹框、返回后再销毁。
-    MessageBoxW(g_hwnd, L"环境检测发现异常，请打开扩展「环境检测」查看详情。",
-                L"银狐环境检测", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+    MessageBoxW(g_hwnd, L"主防发现异常，请打开扩展「主防」查看详情。",
+                L"银狐主防", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
     if (g_hwnd && IsWindow(g_hwnd)) DestroyWindow(g_hwnd);
     PostQuitMessage(0);
 }
@@ -218,8 +277,53 @@ void FallbackMessage() {
 // 跟随系统深浅色，入场上浮淡入、柔和投影、圆形幽灵关闭钮，去除「AI 模板感」）
 std::wstring BuildHtml(const std::string& status, int score, const std::wstring& theme) {
     std::wstring title, sub, accent, soft, line, glow, aura;
+    // 勒索回滚场景：卡片语义与普通扫描告警完全不同，文案单独一套。
+    //   high  = 引擎已自动处置 → 标题陈述"已拦截"，副标题给出撤销指引
+    //   suspect = 仅拦截未动手 → 标题陈述"已拦截操作"，副标题说明需要用户决定
+    // 判定"是否回滚场景"看 g_risk 非空（普通扫描告警不带 --risk 参数）。
+    const bool isHigh    = (g_risk == L"high");
+    const bool isSuspect = (g_risk == L"suspect");
+    const bool isRollback = (isHigh || isSuspect);
+    // ---- 正经杀软模式卡片（2026-09-19，银泊指示）：有风险活动 → 自动处理 → 问撤销 ----
+    //   mbr    = 引导扇区防护（已拦截弹「撤销拦截」；被动弹「恢复引导/信任此变更」）
+    //   proc   = 可疑进程行为已自动终止（进程不能复活，无撤销；文件副作用归回滚引擎管）
+    //   regrun = 可疑自启动项已自动移除（撤销 = 写回注册表原值）
+    //   landed = 落地载荷已自动隔离（撤销 = 移回原位）
+    // 卡面上的「某某程序」归因文本由 JS 经管道取 lastalert 回填（见 alertdetail）。
+    const bool isBoot    = (g_risk == L"mbr");
+    const bool isProc    = (g_risk == L"proc");
+    const bool isRegrun  = (g_risk == L"regrun");
+    const bool isLanded  = (g_risk == L"landed");
+    const bool isAutoKill = (isBoot || isProc || isRegrun || isLanded);
     // 状态色：主色 accent、徽章底色 soft、描边 line、外发光 glow、光晕 aura（克制但有层次）
-    if (status == "infected") {
+    if (isHigh) {
+        title = L"勒索行为已拦截";
+        sub   = g_rolledBack ? L"已终止肇事进程并还原被改写的文件，可在下方撤销本次处理。"
+                             : L"已终止肇事进程。本次未发生文件覆盖，无须撤销。";
+        accent = L"#ff4d57"; soft = L"rgba(255,77,87,.14)"; line = L"rgba(255,77,87,.32)";
+        glow = L"rgba(255,77,87,.28)"; aura = L"rgba(255,77,87,.16)";
+    } else if (isSuspect) {
+        title = L"可疑操作已拦截";
+        sub   = L"检测到疑似批量改写，已阻断但尚未改动你的文件。请确认是否还原。";
+        accent = L"#f5a623"; soft = L"rgba(245,166,35,.16)"; line = L"rgba(245,166,35,.34)";
+        glow = L"rgba(245,166,35,.26)"; aura = L"rgba(245,166,35,.18)";
+    } else if (isBoot) {
+        // 引导扇区：已拦截（有归因，撤销=写回隔离副本）/ 被动（无归因，交用户决定）
+        title = g_rolledBack ? L"已自动拦截 · 引导扇区修改" : L"引导扇区被修改";
+        sub   = g_rolledBack
+                  ? L"<span id=\"alSub\">正在获取事件详情…</span>"
+                  : L"检测到系统引导代码区（MBR）与安装基线不一致。若你近期没有安装系统或引导管理工具，"
+                    L"这可能是 bootkit 正在建立开机持久化，建议「恢复引导」；磁盘工具的合法改动请选「信任此变更」。";
+        accent = L"#ff4d57"; soft = L"rgba(255,77,87,.14)"; line = L"rgba(255,77,87,.32)";
+        glow = L"rgba(255,77,87,.28)"; aura = L"rgba(255,77,87,.16)";
+    } else if (isProc || isRegrun || isLanded) {
+        title = isProc    ? L"可疑行为已自动拦截"
+              : isRegrun  ? L"可疑自启动项已自动拦截"
+                          : L"落地载荷已自动隔离";
+        sub   = L"<span id=\"alSub\">正在获取事件详情…</span>";
+        accent = L"#ff4d57"; soft = L"rgba(255,77,87,.14)"; line = L"rgba(255,77,87,.32)";
+        glow = L"rgba(255,77,87,.28)"; aura = L"rgba(255,77,87,.16)";
+    } else if (status == "infected") {
         title = L"高危：疑似环境异常";
         sub   = L"检测到银狐木马活动迹象，请立即处理。";
         accent = L"#ff4d57"; soft = L"rgba(255,77,87,.14)"; line = L"rgba(255,77,87,.32)";
@@ -237,7 +341,7 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
     }
     // 三种状态的线性图标（描边，随状态色 currentColor 着色），比色块/emoji 更有质感
     std::wstring icon;
-    if (status == "infected") {
+    if (isHigh || isSuspect || isAutoKill || status == "infected") {
         icon = L"<svg viewBox=\"0 0 24 24\" width=\"26\" height=\"26\" fill=\"none\" stroke=\"currentColor\" "
                L"stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"
                L"<path d=\"M12 2l8 3v6c0 5-3.4 8.6-8 11-4.6-2.4-8-6-8-11V5l8-3z\"/>"
@@ -259,30 +363,110 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
     int pct = score; if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     wchar_t pctBuf[16]; swprintf_s(pctBuf, L"%d", pct);
 
-    // 「清除威胁」动作按钮：仅异常状态显示（正常态没有可清除对象）
-    std::wstring action = (status == "normal") ? L"" :
-        L"<div class=\"act\" onclick=\"window.chrome.webview.postMessage('clean')\">清除威胁</div>";
+    // 动作区：三档互斥
+    //   ① 高风险 + 确实覆盖写过 → 「撤销我的处理」+「知道了」（撤销是主操作，视觉加重）
+    //   ② 可疑（仅拦截未动手） → 「还原文件」+「保持拦截」
+    //   ③ 普通扫描告警         → 「清除威胁」（沿用旧行为）
+    std::wstring action;
+    if (isHigh && g_rolledBack) {
+        // 撤销按钮走 doUndo()：前端先播一次确认态（覆盖写不可逆，误点代价高），
+        // 用户再点一次才真正 postMessage 给宿主（见 WebMessageReceived 里的 'undo:' 分支）。
+        action = L"<div class=\"btns\">"
+                 L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">知道了</div>"
+                 L"<div class=\"btn warn\" id=\"undoBtn\" onclick=\"doUndo()\">撤销我的处理</div>"
+                 L"</div>";
+    } else if (isSuspect) {
+        // 注意：回滚引擎目前**不产出** Suspect 档位（见 rollback.cpp 的说明——
+        // 回滚是覆盖写，误伤代价高于漏报）。本分支是预留给上层其他事件源
+        // （文件落地 / 计划任务 / 注册表启动项）复用的：那些场景不涉及覆盖写，
+        // 适合"先问用户再动手"。这里"还原文件"调的是手动的 rollbackdo
+        // （把有快照的文件退回去），而不是 undo —— 因为尚未发生过自动回滚。
+        action = L"<div class=\"btns\">"
+                 L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">保持拦截</div>"
+                 L"<div class=\"btn warn\" id=\"undoBtn\" onclick=\"doUndo()\">还原文件</div>"
+                 L"</div>";
+    } else if (isBoot && !g_rolledBack) {
+        // 引导扇区被动告警（无归因）：交用户决定。「恢复引导」带二次确认（覆盖写不可逆）
+        action = L"<div class=\"btns\">"
+                 L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('boot-accept')\">信任此变更</div>"
+                 L"<div class=\"btn warn\" id=\"bootBtn\" onclick=\"doBootAct()\">恢复引导</div>"
+                 L"</div>";
+    } else if (isBoot) {
+        // 引导扇区自动拦截：终止 + 恢复已完成，「撤销拦截」写回隔离副本（复用 undo: 管道）
+        action = L"<div class=\"btns\">"
+                 L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">知道了</div>"
+                 L"<div class=\"btn warn\" id=\"undoBtn\" onclick=\"doUndo()\">撤销拦截</div>"
+                 L"</div>";
+    } else if (isProc) {
+        // 进程终止无法"撤销"（进程不能复活），只告知；文件副作用由回滚引擎另弹可撤销卡
+        action = L"<div class=\"btns\">"
+                 L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">知道了</div>"
+                 L"</div>";
+    } else if (isRegrun || isLanded) {
+        // 自启动移除 / 落地隔离：可撤销（统一走 undo: 管道 → 服务按 token 前缀分发）
+        action = L"<div class=\"btns\">"
+                 L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">知道了</div>"
+                 L"<div class=\"btn warn\" id=\"undoBtn\" onclick=\"doUndo()\">撤销我的处理</div>"
+                 L"</div>";
+    } else if (status != "normal") {
+        action = L"<div class=\"act\" onclick=\"window.chrome.webview.postMessage('clean')\">清除威胁</div>";
+    }
+
+    // 撤销按钮的二次确认脚本：把按钮换成"确认态"，3 秒无操作自动还原。
+    // 2026-09-19 扩展：引导拦截卡（撤销拦截）/ 自启动移除 / 落地隔离都复用同一脚本，
+    // 统一走 undo:<token> 管道 → 服务按 token 前缀分发（10=引导 20=自启 30=隔离）。
+    const bool needsUndoJs = (isHigh || isSuspect || (isBoot && g_rolledBack) || isRegrun || isLanded);
+    std::wstring undoJs;
+    if (needsUndoJs) {
+        const std::wstring confirmTxt = isSuspect ? L"确认还原？" : (isBoot ? L"确认撤销拦截？" : L"确认撤销？");
+        const std::wstring normalTxt  = isSuspect ? L"还原文件"   : (isBoot ? L"撤销拦截"     : L"撤销我的处理");
+        undoJs =
+            L"var _uArmed=0,_uTimer=null;function doUndo(){"
+            L"var b=document.getElementById('undoBtn');if(!b)return;"
+            L"if(!_uArmed){_uArmed=1;b.className='btn danger';"
+            L"b.textContent='" + confirmTxt + L"';"
+            L"_uTimer=setTimeout(function(){_uArmed=0;b.className='btn warn';"
+            L"b.textContent='" + normalTxt + L"';},3000);return;}"
+            L"clearTimeout(_uTimer);b.textContent='正在还原…';b.className='btn ghost';"
+            L"window.chrome.webview.postMessage('undo:" + U8W(g_undoToken) + L"');}";
+    }
+    // 「恢复引导」二次确认（被动 mbr 卡）：覆盖写不可逆，误点代价高
+    std::wstring bootJs;
+    if (isBoot && !g_rolledBack) {
+        bootJs =
+            L"var _bArmed=0,_bTimer=null;function doBootAct(){"
+            L"var b=document.getElementById('bootBtn');if(!b)return;"
+            L"if(!_bArmed){_bArmed=1;b.className='btn danger';b.textContent='确认恢复引导？';"
+            L"_bTimer=setTimeout(function(){_bArmed=0;b.className='btn warn';b.textContent='恢复引导';},3000);return;}"
+            L"clearTimeout(_bTimer);b.textContent='正在恢复…';b.className='btn ghost';"
+            L"window.chrome.webview.postMessage('boot-restore');}";
+    }
+    // 自动拦截卡的「某某程序」归因回填：页面加载即向宿主要 lastalert
+    // （进程名不能拼进命令行 —— toast.exe 命令行是外部可写边界，有注入面）
+    std::wstring detailJs;
+    if (isAutoKill && !(isBoot && !g_rolledBack)) {
+        detailJs = L"window.chrome.webview.postMessage('alertdetail');";
+    }
 
     return
-        L"<!doctype html><html data-theme=\"" + theme + L"\"><head><meta charset=\"utf-8\">"
-        L"<style>"
+        L"<!doctype html><html data-theme=\"" + theme + L"\"><head><meta charset=\"utf-8\">"        L"<style>"
         L"*{margin:0;padding:0;box-sizing:border-box;}"
         L"html,body{width:100%;height:100%;overflow:hidden;"
         L"font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,-apple-system,sans-serif;}"
         // 卡片：状态色光晕（徽章后）+ 渐变底 + 状态描边 + 柔和投影；扁平化无内高光；初始透明供进场动画
-        L"body{--bg1:#ffffff;--bg2:#eef1f7;--fg:#141923;--sub:rgba(20,25,35,.56);"
-        L"--brand:rgba(20,25,35,.36);--shadow:rgba(20,30,50,.22);--track:rgba(20,25,35,.10);"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);"
+        L"--brand:rgba(30,34,46,.38);--shadow:rgba(24,30,48,.20);--track:rgba(30,34,46,.10);"
         L"background:radial-gradient(160px 150px at 50px 50%,var(--accent-aura) 0%,transparent 72%),"
         L"linear-gradient(158deg,var(--bg1),var(--bg2));"
         L"border-radius:18px;border:1px solid var(--accent-line);"
         L"box-shadow:0 18px 46px var(--shadow),0 0 0 1px var(--accent-line);"
         L"color:var(--fg);display:flex;align-items:center;gap:18px;padding:22px 24px;position:relative;opacity:0;}"
-        L"[data-theme=\"dark\"] body{--bg1:#1a2030;--bg2:#222b3e;--fg:#eef2f8;"
-        L"--sub:rgba(238,242,248,.60);--brand:rgba(238,242,248,.38);--shadow:rgba(0,0,0,.52);"
-        L"--track:rgba(255,255,255,.13);}"
-        L"@media (prefers-color-scheme:dark){body:not([data-theme=\"light\"]){"
-        L"--bg1:#1a2030;--bg2:#222b3e;--fg:#eef2f8;--sub:rgba(238,242,248,.60);"
-        L"--brand:rgba(238,242,248,.38);--shadow:rgba(0,0,0,.52);--track:rgba(255,255,255,.13);}}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;"
+        L"--sub:rgba(232,234,242,.60);--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);"
+        L"--track:rgba(255,255,255,.12);}"
+        L"@media (prefers-color-scheme:dark){html:not([data-theme=\"light\"]) body{"
+        L"--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--track:rgba(255,255,255,.12);}}"
         L"@keyframes rise{from{opacity:0;transform:translateY(14px) scale(.985);}to{opacity:1;transform:translateY(0) scale(1);}}"
         L".show{animation:rise .36s cubic-bezier(.22,.61,.36,1) both;}"
         L".hide{animation:fall .26s ease-in both;}"
@@ -313,7 +497,28 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
         L"transition:transform .16s cubic-bezier(.22,.61,.36,1),box-shadow .2s ease,filter .18s ease;}"
         L".act:hover{transform:translateY(-1px);filter:brightness(1.06);box-shadow:0 7px 18px var(--accent-glow);}"
         L".act:active{transform:translateY(0) scale(.97);}"
-        L"</style></head><body style=\"--accent:" + accent + L";--accent-soft:" + soft + L";"
+        // 双按钮行（撤销场景）：等宽并排，主操作在右（符合中文界面「确认在右」的习惯）
+        L".btns{position:absolute;right:24px;bottom:12px;left:24px;display:flex;gap:9px;}"
+        L".btn{flex:1;text-align:center;padding:8px 0;border-radius:11px;font-size:12.5px;"
+        L"font-weight:800;letter-spacing:.2px;cursor:pointer;user-select:none;"
+        L"transition:transform .16s cubic-bezier(.22,.61,.36,1),background .18s ease,"
+        L"box-shadow .2s ease,filter .18s ease;}"
+        L".btn:active{transform:scale(.97);}"
+        L".btn.ghost{background:rgba(127,127,127,.12);color:var(--fg);}"
+        L".btn.ghost:hover{background:rgba(127,127,127,.2);}"
+        // warn = 撤销入口常态（琥珀色，提醒"这是个反悔操作"但不必紧张）
+        L".btn.warn{background:rgba(245,166,35,.16);color:#b06a00;"
+        L"box-shadow:inset 0 0 0 1px rgba(245,166,35,.34);}"
+        L".btn.warn:hover{background:rgba(245,166,35,.26);}"
+        L"[data-theme=\"dark\"] .btn.warn{color:#f5c26b;}"
+        // danger = 二次确认态（转为红色实心，视觉上明确进入"即将执行"）
+        L".btn.danger{background:#e03225;color:#fff;box-shadow:0 4px 12px rgba(224,50,37,.32);}"
+        L".btn.danger:hover{filter:brightness(1.07);}"
+        // 撤销场景下品牌署名要让位给按钮行，避免重叠
+        L"body.has-btns .brand{bottom:56px;}"
+        L"</style></head><body class=\""
+        + std::wstring(isRollback || isAutoKill ? L"has-btns" : L"") +
+        L"\" style=\"--accent:" + accent + L";--accent-soft:" + soft + L";"
         L"--accent-line:" + line + L";--accent-glow:" + glow + L";--accent-aura:" + aura + L"\">"
         L"<div class=\"badge\">" + icon + L"</div>"
         L"<div class=\"content\">"
@@ -322,9 +527,10 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
         L"<div class=\"meter\"><div class=\"track\"><div class=\"fill\"></div></div>"
         L"<div class=\"score\">风险评分<b>" + std::wstring(scoreBuf) + L"</b></div></div>"
         L"</div>"
-        L"<div class=\"brand\">银狐环境检测 · SilverFox Guard</div>"
+        L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>"
         L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},260)\">✕</div>"
         + action +
+        L"<script>" + bootJs + detailJs + undoJs + L"</script>" +
         L"</body></html>";
 }
 
@@ -366,8 +572,8 @@ static std::wstring BuildCleanConfirmHtml() {
         L"*{margin:0;padding:0;box-sizing:border-box;}"
         L"html,body{width:100%;height:100%;overflow:hidden;"
         L"font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,-apple-system,sans-serif;}"
-        L"body{--bg1:#ffffff;--bg2:#eef1f7;--fg:#141923;--sub:rgba(20,25,35,.56);"
-        L"--brand:rgba(20,25,35,.36);--shadow:rgba(20,30,50,.22);--track:rgba(20,25,35,.10);"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);"
+        L"--brand:rgba(30,34,46,.38);--shadow:rgba(24,30,48,.20);--track:rgba(30,34,46,.10);"
         L"--red:#ff4d57;--red-soft:rgba(255,77,87,.12);--red-line:rgba(255,77,87,.35);"
         L"--red-glow:rgba(255,77,87,.22);"
         L"background:radial-gradient(150px 130px at 60px 40px,rgba(255,77,87,.13) 0%,transparent 70%),"
@@ -375,8 +581,8 @@ static std::wstring BuildCleanConfirmHtml() {
         L"box-shadow:0 18px 46px var(--shadow),0 0 0 1px var(--red-line);color:var(--fg);"
         L"display:flex;flex-direction:column;gap:10px;padding:16px 20px;justify-content:center;"
         L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
-        L"[data-theme=\"dark\"] body{--bg1:#1a2030;--bg2:#222b3e;--fg:#eef2f8;--sub:rgba(238,242,248,.60);"
-        L"--brand:rgba(238,242,248,.38);--shadow:rgba(0,0,0,.52);--track:rgba(255,255,255,.13);}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--track:rgba(255,255,255,.12);}"
         L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
         L".head{display:flex;align-items:center;gap:9px;}"
         L".badge{flex:0 0 auto;width:34px;height:34px;border-radius:11px;display:grid;place-items:center;"
@@ -433,16 +639,16 @@ static std::wstring BuildCleaningHtml(bool adv) {
         L"*{margin:0;padding:0;box-sizing:border-box;}"
         L"html,body{width:100%;height:100%;overflow:hidden;"
         L"font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,-apple-system,sans-serif;}"
-        L"body{--bg1:#ffffff;--bg2:#eef1f7;--fg:#141923;--sub:rgba(20,25,35,.56);"
-        L"--brand:rgba(20,25,35,.36);--shadow:rgba(20,30,50,.22);--track:rgba(20,25,35,.10);"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);"
+        L"--brand:rgba(30,34,46,.38);--shadow:rgba(24,30,48,.20);--track:rgba(30,34,46,.10);"
         L"--line:rgba(255,77,87,.32);--glow:rgba(255,77,87,.22);"
         L"background:radial-gradient(160px 150px at 50px 50%,rgba(255,77,87,.14) 0%,transparent 72%),"
         L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--line);"
         L"box-shadow:0 18px 46px var(--shadow),0 0 0 1px var(--line);color:var(--fg);"
         L"display:flex;flex-direction:column;gap:10px;padding:20px 24px;position:relative;justify-content:center;"
         L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
-        L"[data-theme=\"dark\"] body{--bg1:#1a2030;--bg2:#222b3e;--fg:#eef2f8;--sub:rgba(238,242,248,.60);"
-        L"--brand:rgba(238,242,248,.38);--shadow:rgba(0,0,0,.52);--track:rgba(255,255,255,.13);}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--track:rgba(255,255,255,.12);}"
         L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
         L".t{font-size:15px;font-weight:800;letter-spacing:.3px;display:flex;align-items:center;gap:9px;}"
         L".dot{width:9px;height:9px;border-radius:50%;background:#ff4d57;box-shadow:0 0 0 4px rgba(255,77,87,.16);"
@@ -461,7 +667,7 @@ static std::wstring BuildCleaningHtml(bool adv) {
         L"<div class=\"s\" id=\"ph\">" + std::wstring(tip) + L"</div>"
         L"<div class=\"track\"><div class=\"fill\" id=\"bar\"></div></div>"
         L"<div class=\"row\"><div class=\"cur\" id=\"cur\"></div><div class=\"pct\" id=\"pct\">0%</div></div>"
-        L"<div class=\"brand\">银狐环境检测 · SilverFox Guard</div>"
+        L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>"
         L"</body></html>";
 }
 
@@ -472,8 +678,8 @@ static std::wstring BuildAdvancedPromptHtml(int failedCount) {
         L"*{margin:0;padding:0;box-sizing:border-box;}"
         L"html,body{width:100%;height:100%;overflow:hidden;"
         L"font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,-apple-system,sans-serif;}"
-        L"body{--bg1:#ffffff;--bg2:#eef1f7;--fg:#141923;--sub:rgba(20,25,35,.56);"
-        L"--brand:rgba(20,25,35,.36);--shadow:rgba(20,30,50,.22);--track:rgba(20,25,35,.10);"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);"
+        L"--brand:rgba(30,34,46,.38);--shadow:rgba(24,30,48,.20);--track:rgba(30,34,46,.10);"
         L"--amber:#f5a623;--amber-soft:rgba(245,166,35,.13);--amber-line:rgba(245,166,35,.36);"
         L"--amber-glow:rgba(245,166,35,.24);"
         L"background:radial-gradient(150px 130px at 60px 40px,rgba(245,166,35,.13) 0%,transparent 70%),"
@@ -481,8 +687,8 @@ static std::wstring BuildAdvancedPromptHtml(int failedCount) {
         L"box-shadow:0 18px 46px var(--shadow),0 0 0 1px var(--amber-line);color:var(--fg);"
         L"display:flex;flex-direction:column;gap:8px;padding:14px 18px;justify-content:center;"
         L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
-        L"[data-theme=\"dark\"] body{--bg1:#1a2030;--bg2:#222b3e;--fg:#eef2f8;--sub:rgba(238,242,248,.60);"
-        L"--brand:rgba(238,242,248,.38);--shadow:rgba(0,0,0,.52);--track:rgba(255,255,255,.13);}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--track:rgba(255,255,255,.12);}"
         L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
         L".head{display:flex;align-items:center;gap:9px;}"
         L".badge{flex:0 0 auto;width:34px;height:34px;border-radius:11px;display:grid;place-items:center;"
@@ -546,15 +752,15 @@ static std::wstring BuildCleanResultHtml() {
         L"*{margin:0;padding:0;box-sizing:border-box;}"
         L"html,body{width:100%;height:100%;overflow:hidden;"
         L"font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,-apple-system,sans-serif;}"
-        L"body{--bg1:#ffffff;--bg2:#eef1f7;--fg:#141923;--sub:rgba(20,25,35,.56);"
-        L"--brand:rgba(20,25,35,.36);--shadow:rgba(20,30,50,.22);"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);"
+        L"--brand:rgba(30,34,46,.38);--shadow:rgba(24,30,48,.20);"
         L"background:radial-gradient(160px 150px at 50px 50%,var(--aura) 0%,transparent 72%),"
         L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--line);"
         L"box-shadow:0 18px 46px var(--shadow),0 0 0 1px var(--line);color:var(--fg);"
         L"display:flex;align-items:center;gap:16px;padding:18px 22px;position:relative;"
         L"animation:rise .34s cubic-bezier(.22,.61,.36,1) both;}"
-        L"[data-theme=\"dark\"] body{--bg1:#1a2030;--bg2:#222b3e;--fg:#eef2f8;--sub:rgba(238,242,248,.60);"
-        L"--brand:rgba(238,242,248,.38);--shadow:rgba(0,0,0,.52);}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);}"
         L"@keyframes rise{from{opacity:0;transform:translateY(12px) scale(.985);}to{opacity:1;transform:none;}}"
         L".badge{flex:0 0 auto;width:54px;height:54px;border-radius:16px;display:grid;place-items:center;"
         L"color:var(--accent);background:var(--soft);box-shadow:inset 0 0 0 1px var(--line),0 6px 16px var(--glow);}"
@@ -582,7 +788,7 @@ static std::wstring BuildCleanResultHtml() {
         + (restartLine.empty() ? std::wstring() : L"<div class=\"d3\">" + restartLine + L"</div>")
         + (failLine.empty() ? std::wstring() : L"<div class=\"d2\">" + failLine + L"</div>") +
         L"</div>"
-        L"<div class=\"brand\">银狐环境检测 · SilverFox Guard</div>"
+        L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>"
         L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},260)\">✕</div>"
         L"</body></html>";
 }
@@ -768,7 +974,43 @@ HRESULT OnController(HRESULT hr, ICoreWebView2Controller* ctrl) {
             LPWSTR p = nullptr;
             if (SUCCEEDED(a->get_WebMessageAsJson(&p)) && p) {
                 std::wstring s = p; CoTaskMemFree(p);
-                if (s.find(L"clean-adv") != std::wstring::npos) {
+                // ---- 撤销最近一次自动处置（勒索回滚场景）----
+                // 前端在二次确认后才发 `undo:<token>`。这里校验 token 与启动时
+                // 收到的一致（前端可能被 NavigateToString 重渲染，但 token 全程不变），
+                // 再转成服务管道命令 rollbackundo。
+                if (s.find(L"undo:") != std::wstring::npos) {
+                    std::wstring tok = s.substr(s.find(L"undo:") + 5);
+                    // 去掉 JSON 收尾引号（get_WebMessageAsJson 对字符串会带引号）
+                    while (!tok.empty() && (tok.back() == L'"' || tok.back() == L'\\')) tok.pop_back();
+                    std::string tokA = W2U8(tok);
+                    WriteDbg(L"[undo] 用户确认撤销，token=" + tok + L"\r\n");
+                    std::string resp = UndoPipeRequest(tokA);
+                    g_html = sf::BuildUndoResultHtml(resp);
+                    if (g_webview) g_webview->NavigateToString(g_html.c_str());
+                } else if (s.find(L"alertdetail") != std::wstring::npos) {
+                    // 自动拦截卡的「某某程序」归因回填：管道取 lastalert → ExecuteScript 填占位。
+                    // 归因文本只存在于服务端（toast.exe 命令行是外部可写边界，不能走明文参数）。
+                    std::string resp = ProbePipeRequest("{\"cmd\":\"lastalert\"}");
+                    std::string subU8 = sf::JsonGetString(resp, "sub");
+                    if (subU8.empty()) subU8 = "检测到风险活动，已自动处理。";
+                    if (g_webview) {
+                        std::wstring js = L"(function(){var e=document.getElementById('alSub');"
+                                          L"if(e){e.textContent='" + JsSafe(subU8) + L"';}})();";
+                        g_webview->ExecuteScript(js.c_str(), nullptr);
+                    }
+                } else if (s.find(L"boot-restore") != std::wstring::npos) {
+                    // 引导扇区被动卡「恢复引导」：基线写回扇区 0，结果卡反馈
+                    WriteDbg(L"[boot] 用户确认恢复引导\r\n");
+                    std::string resp = ProbePipeRequest("{\"cmd\":\"bootrestore\"}");
+                    g_html = sf::BuildBootResultHtml(resp, L"引导记录已恢复", L"已把磁盘引导代码还原为安装时的基线。");
+                    if (g_webview) g_webview->NavigateToString(g_html.c_str());
+                } else if (s.find(L"boot-accept") != std::wstring::npos) {
+                    // 引导扇区被动卡「信任此变更」：当前 MBR 重立为基线（磁盘工具合法改引导）
+                    WriteDbg(L"[boot] 用户信任当前引导记录\r\n");
+                    std::string resp = ProbePipeRequest("{\"cmd\":\"bootaccept\"}");
+                    g_html = sf::BuildBootResultHtml(resp, L"已信任当前引导记录", L"当前引导代码已重立为基线，此后不再就本次变更告警。");
+                    if (g_webview) g_webview->NavigateToString(g_html.c_str());
+                } else if (s.find(L"clean-adv") != std::wstring::npos) {
                     if (s.find(L"clean-adv-cancel") != std::wstring::npos) {
                         WriteDbg(L"[clean] 用户暂不启用高级删除\r\n");
                         g_closing = true; DestroyWindow(g_hwnd);   // 暂不处理 → 关闭弹窗
@@ -786,6 +1028,14 @@ HRESULT OnController(HRESULT hr, ICoreWebView2Controller* ctrl) {
                     }
                 } else if (s.find(L"clean") != std::wstring::npos) {
                     StartCleanFlow();             // 「清除威胁」按钮 → 自定义确认卡
+                } else if (s.find(L"probe-clean") != std::wstring::npos) {
+                    // 右键查杀卡片「立即清除」：连服务管道执行单文件清除，结果卡重渲染
+                    if (!g_probePath.empty()) {
+                        WriteDbg(L"[probe] 用户点击「立即清除」\r\n");
+                        std::string cleanResp = ProbeCleanRequest(g_probePath);
+                        g_html = sf::BuildProbeCleanHtml(cleanResp, g_probePath);
+                        if (g_webview) g_webview->NavigateToString(g_html.c_str());
+                    }
                 } else if (s.find(L"close") != std::wstring::npos && !g_closing) {
                     g_closing = true; DestroyWindow(g_hwnd);
                 }
@@ -892,11 +1142,25 @@ static bool SpawnInUserSession(HANDLE hToken, const std::wstring& cmd) {
     return ok != FALSE;
 }
 
-void NotifyAnomaly(const std::string& status, int score) {
+void NotifyAnomaly(const std::string& status, int score,
+                   const std::string& risk, const std::string& undoToken, bool rolledBack) {
     wchar_t exepath[MAX_PATH];
     GetModuleFileNameW(nullptr, exepath, MAX_PATH);
     std::wstring cmd = std::wstring(L"\"") + exepath + L"\" --toast --status=" + U8W(status)
                        + L" --score=" + std::to_wstring(score);
+    // 撤销凭据经命令行传递：token 由引擎生成，字符集是 [0-9a-f]，无引号/空格风险。
+    // 这里仍做一次白名单过滤——命令行是外部可写边界（任何进程都能带同名参数拉起本
+    // 程序），若把任意字符串原样透传给服务，等于开了一个"诱导主防执行 undo"的口子。
+    if (!risk.empty())      cmd += L" --risk=" + U8W(risk);
+    if (rolledBack)         cmd += L" --rolledback=1";
+    if (!undoToken.empty()) {
+        std::string safe;
+        for (char c : undoToken) {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (hex && safe.size() < 32) safe.push_back(c);
+        }
+        if (!safe.empty()) cmd += L" --undo=" + U8W(safe);
+    }
 
     DWORD sid = WTS_CURRENT_SESSION;
     bool found = false;
@@ -915,7 +1179,8 @@ void NotifyAnomaly(const std::string& status, int score) {
     else    WriteDbg(L"[notify] 拉起 toast 失败\r\n");
     if (hToken) CloseHandle(hToken);
 }
-int RunToast(const std::string& status, int score) {
+int RunToast(const std::string& status, int score,
+             const std::string& risk, const std::string& undoToken, bool rolledBack) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     // 固定版本运行时部署到非系统目录时，渲染进程沙箱常因权限崩溃（表现为渲染子进程反复崩溃重启、
     // 内容不显示）。关闭渲染进程沙箱以稳定渲染（本地通知工具，风险可接受）。
@@ -923,6 +1188,9 @@ int RunToast(const std::string& status, int score) {
     g_theme = GetSystemTheme();
     g_currentStatus = status;   // 记住当前状态/评分，确认卡取消后回渲染
     g_currentScore  = score;
+    g_risk = U8W(risk);   // risk 只有 "high"/"suspect" 两种取值，纯 ASCII，UTF-8/ANSI 一致
+    g_undoToken = undoToken;
+    g_rolledBack = rolledBack;
     g_html = BuildHtml(status, score, g_theme);
     g_closing = false; g_fallbackDone = false;
 
@@ -935,7 +1203,7 @@ int RunToast(const std::string& status, int score) {
     wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = L"SFEnvToast";
     // 背景刷使用卡片渐变底色（bg2），使瞬时状态只是「空卡片」而非黑/白块
-    wc.hbrBackground = CreateSolidBrush(g_theme == L"dark" ? RGB(35, 43, 61) : RGB(238, 241, 247));
+    wc.hbrBackground = CreateSolidBrush(g_theme == L"dark" ? RGB(15, 15, 20) : RGB(238, 240, 245));
     RegisterClassExW(&wc);
 
     // 仍创建在屏幕外（窗口「可见」但不在可视区域）：WebView2 默认底色为白，navdone 前会白屏一闪，
@@ -1013,8 +1281,8 @@ static std::wstring PrewarmResultPathW() {
     wchar_t p[MAX_PATH] = {0};
     std::wstring dir;
     if (SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, p) == S_OK)
-        dir = std::wstring(p) + L"\\SilverFoxEnvScan";
-    else dir = L"C:\\ProgramData\\SilverFoxEnvScan";
+        dir = std::wstring(p) + L"\\SilverFoxGuard";
+    else dir = L"C:\\ProgramData\\SilverFoxGuard";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\prewarm_result.txt";
 }
@@ -1059,7 +1327,7 @@ int RunPrewarm() {
     WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = L"SFEnvToast";
-    wc.hbrBackground = CreateSolidBrush(g_theme == L"dark" ? RGB(35, 43, 61) : RGB(238, 241, 247));
+    wc.hbrBackground = CreateSolidBrush(g_theme == L"dark" ? RGB(15, 15, 20) : RGB(238, 240, 245));
     RegisterClassExW(&wc);
 
     g_posX = x; g_posY = y; g_w = W; g_h = H;
@@ -1120,4 +1388,541 @@ int RunPrewarm() {
     CoUninitialize(); return 0;
 }
 
+// ---------------------------------------------------------------------------
+//  手动扫描进度右下角弹窗（--scanprogress）
+//  实例：扩展点「立即检查」→ 服务全盘扫描 → 本弹窗显示进度条与已扫描文件数，
+//       扫描完成（scan_progress.txt 出现 done）→ 读 prewarm_result.txt 最终状态 →
+//       切换结果卡（正常=绿色完成卡 / 异常=告警卡，异常可点击「清除威胁」）。
+// ---------------------------------------------------------------------------
+static std::wstring BuildScanProgressHtmlSafe() {
+    return L"<!doctype html><html data-theme=\"" + g_theme + L"\"><head><meta charset=\"utf-8\"><style>"
+        L"*{margin:0;padding:0;box-sizing:border-box;}"
+        L"html,body{width:100%;height:100%;overflow:hidden;"
+        L"font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,-apple-system,sans-serif;}"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);"
+        L"--brand:rgba(30,34,46,.38);--shadow:rgba(24,30,48,.20);--track:rgba(30,34,46,.10);"
+        L"--blue:#2f6bff;--blue-soft:rgba(47,107,255,.12);--blue-line:rgba(47,107,255,.34);--blue-glow:rgba(47,107,255,.22);"
+        L"background:radial-gradient(160px 150px at 50px 50%,rgba(47,107,255,.13) 0%,transparent 72%),"
+        L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--blue-line);"
+        L"box-shadow:0 18px 46px var(--shadow),0 0 0 1px var(--blue-line);color:var(--fg);"
+        L"display:flex;flex-direction:column;gap:10px;padding:20px 24px;position:relative;justify-content:center;"
+        L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--track:rgba(255,255,255,.12);}"
+        L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
+        L".t{font-size:15px;font-weight:800;letter-spacing:.3px;display:flex;align-items:center;gap:9px;}"
+        L".ic{width:20px;height:20px;color:var(--blue);}"
+        L".s{font-size:12px;color:var(--sub);}"
+        L".track{height:8px;border-radius:999px;background:var(--track);overflow:hidden;margin-top:2px;position:relative;}"
+        L".fill{position:absolute;inset:0;width:38%;border-radius:999px;"
+        L"background:linear-gradient(90deg,#7ea4ff,#2f6bff);animation:flow 1.6s ease-in-out infinite alternate;}"
+        L"@keyframes flow{from{left:-22%;}to{left:78%;}}"
+        L".row{display:flex;align-items:center;justify-content:space-between;gap:12px;}"
+        L".cnt{font-size:12px;color:var(--sub);}"
+        L".cnt b{color:var(--blue);font-weight:800;}"
+        L".cur{font-size:10.5px;color:var(--brand);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
+        L".brand{position:absolute;left:24px;bottom:9px;font-size:9.5px;color:var(--brand);letter-spacing:.5px;}"
+        L".close{position:absolute;top:12px;right:12px;width:24px;height:24px;border-radius:50%;"
+        L"display:grid;place-items:center;font-size:13px;color:var(--sub);cursor:pointer;transition:background .15s,color .15s;}"
+        L".close:hover{background:rgba(127,127,127,.16);color:var(--fg);}"
+        L"</style></head><body>"
+        L"<div class=\"t\"><svg class=\"ic\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\"><path d=\"M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3Z\"/><path d=\"M8.6 11.6l2.4 2.4 4.4-4.6\" stroke-linecap=\"round\"/></svg>正在全盘扫描</div>"
+        L"<div class=\"s\" id=\"ph\">逐盘遍历所有固定磁盘，检查深层目录与盘根表层文件…</div>"
+        L"<div class=\"track\"><i class=\"fill\"></i></div>"
+        L"<div class=\"row\"><div class=\"cur\" id=\"cur\"></div><div class=\"cnt\">已扫描 <b id=\"cnt\">0</b> 个文件</div></div>"
+        L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>"
+        L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},220)\">✕</div>"
+        L"</body></html>";
+}
+
+// 进度文件读取（供轮询）
+static bool ReadScanProgress(std::string& phase, long long& done, std::string& cur) {
+    phase.clear(); done = 0; cur.clear();
+    wchar_t p[MAX_PATH] = {0};
+    std::wstring dir;
+    if (SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, p) == S_OK)
+        dir = std::wstring(p) + L"\\SilverFoxGuard";
+    else dir = L"C:\\ProgramData\\SilverFoxGuard";
+    HANDLE h = CreateFileW((dir + L"\\scan_progress.txt").c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[1200] = {0}; DWORD n = 0;
+    ReadFile(h, buf, sizeof(buf) - 1, &n, nullptr);
+    CloseHandle(h);
+    if (!n) return false;
+    std::string s(buf, n);
+    size_t a = s.find("phase=");
+    if (a != std::string::npos) {
+        size_t b = s.find(' ', a);
+        phase = s.substr(a + 6, (b == std::string::npos ? s.size() : b) - (a + 6));
+    }
+    a = s.find("done=");
+    if (a != std::string::npos) {
+        size_t b = a + 5;
+        while (b < s.size() && s[b] >= '0' && s[b] <= '9') done = done * 10 + (s[b++] - '0');
+    }
+    a = s.find("current=");
+    if (a != std::string::npos) cur = s.substr(a + 8);
+    return true;
+}
+
+int RunScanProgress() {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", L"--no-sandbox");
+    g_theme = GetSystemTheme();
+    // 进度卡直接作为首导航：navdone 即进场显示（g_prewarm 保持 false）
+    g_prewarm = false;
+    g_html = BuildScanProgressHtmlSafe();
+    g_closing = false; g_fallbackDone = false;
+
+    const int W = 384, H = 200, M = 18;
+    int x, y; GetDockPos(x, y, W, H, M);
+    WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"SFEnvToast";   // 与 toast 同名类，避免重复注册冲突（进程独立无碍）
+    wc.hbrBackground = CreateSolidBrush(g_theme == L"dark" ? RGB(15, 15, 20) : RGB(238, 240, 245));
+    RegisterClassExW(&wc);
+    g_posX = x; g_posY = y; g_w = W; g_h = H;
+    RECT scr; GetWindowRect(GetDesktopWindow(), &scr);
+    int ox = scr.right + W + 40, oy = scr.bottom + H + 40;
+    g_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"SFEnvToast", L"",
+        WS_POPUP, ox, oy, W, H, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!g_hwnd) { CoUninitialize(); return 1; }
+    int corner = 2; DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof(corner));
+    ShowWindow(g_hwnd, SW_SHOW);
+
+    char ep[MAX_PATH]; GetModuleFileNameA(nullptr, ep, MAX_PATH);
+    std::string dir = ep; size_t q = dir.find_last_of('\\');
+    std::wstring runtime = (q != std::string::npos) ? U8W(dir.substr(0, q + 1) + "WebView2Runtime") : L"";
+    wchar_t envbuf[512] = {0};
+    if (GetEnvironmentVariableW(L"SF_WV2_DIR", envbuf, 512)) runtime = envbuf;
+    wchar_t pidbuf[32]; swprintf_s(pidbuf, L"_%lu", (unsigned long)GetCurrentProcessId());
+    std::wstring userData = Wv2BaseDir() + L"\\WV2Data" + pidbuf;
+
+    g_envH = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+        [](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            if (FAILED(hr) || !env) return S_OK;
+            g_ctrlH = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(OnController);
+            env->CreateCoreWebView2Controller(g_hwnd, g_ctrlH.Get());
+            return S_OK;
+        });
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
+        runtime.empty() ? nullptr : runtime.c_str(), userData.c_str(), nullptr, g_envH.Get());
+    if (FAILED(hr)) { CoUninitialize(); return 0; }
+
+    // 轮询循环：显示进度 → 检测 done → 切换结果卡 / 超时退出
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(150);
+    bool shownResult = false;
+    MSG msg;
+    while (std::chrono::steady_clock::now() < deadline) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { CoUninitialize(); return 0; }
+            TranslateMessage(&msg); DispatchMessageW(&msg);
+        }
+        std::string phase, cur; long long done = 0; std::string status; int score = 0;
+        if (ReadScanProgress(phase, done, cur) && g_webview) {
+            // 进度刷新
+            std::wstring js = L"(function(){var c=document.getElementById('cnt');if(c)c.textContent='" +
+                std::to_wstring(done) + L"';var e=document.getElementById('cur');if(e)e.textContent='" + JsSafe(cur) + L"';})();";
+            g_webview->ExecuteScript(js.c_str(), nullptr);
+            if (phase == "done" && !shownResult) {
+                // 扫描完成：读最终状态（prewarm_result.txt 由 NM 宿主写入）
+                if (ReadPrewarmResult(status, score)) {
+                    shownResult = true;
+                    g_prewarm = false;
+                    g_html = BuildHtml(status, score, g_theme);   // normal=绿色卡 / 异常=告警卡
+                    if (g_webview) g_webview->NavigateToString(g_html.c_str());
+                }
+            }
+        }
+        Sleep(200);
+    }
+    if (!shownResult) WriteDbg(L"[scanprog] timeout 150s without done\r\n");
+    CoUninitialize(); return 0;
+}
+
+// ---- 第四部分：右键自定义查杀卡片（追加于 toast.cpp 的 namespace sf 内）----
+
+// HTML 转义（嵌入卡片用）
+static std::wstring EscHtmlW(const std::wstring& s) {
+    std::wstring r;
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'&': r += L"&amp;"; break;
+            case L'<': r += L"&lt;"; break;
+            case L'>': r += L"&gt;"; break;
+            case L'"': r += L"&quot;"; break;
+            default: r += c;
+        }
+    }
+    return r;
+}
+
+// 查杀结果卡片（level/score/type/title/file/hitsRawJson）
+std::wstring BuildProbeHtml(int level, int score, const std::string& type, const std::string& title,
+                            const std::wstring& fileW, const std::string& hitsRaw) {
+    const wchar_t* fmt =
+        L"<!doctype html><html data-theme=\"light\"><head><meta charset=\"utf-8\"><style>"
+        L"*{margin:0;padding:0;box-sizing:border-box;}"
+        L"html,body{width:100%;height:100%;overflow:hidden;font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,sans-serif;}"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);--brand:rgba(30,34,46,.38);"
+        L"--shadow:rgba(24,30,48,.20);--line:rgba(30,34,46,.10);"
+        L"background:radial-gradient(160px 150px at 50px 50%,rgba(47,107,255,.11) 0%,transparent 72%),"
+        L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--line);"
+        L"box-shadow:0 18px 46px var(--shadow);color:var(--fg);display:flex;flex-direction:column;"
+        L"padding:20px 24px 16px;position:relative;gap:12px;"
+        L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--line:rgba(255,255,255,.10);}"
+        L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
+        L".top{display:flex;align-items:center;gap:9px;}"
+        L".title{font-size:15px;font-weight:800;letter-spacing:.3px;}"
+        L".sub{font-size:11px;color:var(--sub);margin-top:2px;}"
+        L".file{margin-top:2px;font-size:11.5px;color:var(--fg);background:rgba(127,127,127,.09);"
+        L"border-radius:9px;padding:7px 10px;word-break:break-all;line-height:1.5;}"
+        L".badge{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.5px;}"
+        L".b0{background:rgba(35,190,120,.13);color:#14975c;}"
+        L".b1{background:rgba(232,168,34,.15);color:#c78a12;}"
+        L".b2{background:rgba(235,68,60,.14);color:#e03225;}"
+        L".mid{display:flex;align-items:center;justify-content:space-between;gap:10px;}"
+        L".score{font-size:11px;color:var(--sub);}.score b{font-size:14px;color:var(--fg);}"
+        L".hits{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:7px;min-height:0;}"
+        L".hit{font-size:11.5px;line-height:1.55;border-radius:10px;padding:8px 11px;background:rgba(127,127,127,.07);}"
+        L".hit b{font-weight:800;display:block;font-size:12px;}"
+        L".hit .d{color:var(--sub);}"
+        L".s3{border-left:3px solid #e03225;}.s2{border-left:3px solid #e0a018;}.s1{border-left:3px solid rgba(127,127,127,.5);}.s0{border-left:3px solid rgba(47,107,255,.5);}"
+        L".btns{display:flex;gap:9px;}"
+        L".btn{flex:1;text-align:center;padding:9px 0;border-radius:11px;font-size:13px;font-weight:800;cursor:pointer;user-select:none;}"
+        L".btn.ghost{background:rgba(127,127,127,.12);color:var(--fg);transition:background .15s;}"
+        L".btn.ghost:hover{background:rgba(127,127,127,.22);}"
+        L".btn.danger{background:linear-gradient(135deg,#ff5f52,#e03225);color:#fff;box-shadow:0 6px 16px rgba(224,50,37,.35);transition:filter .15s;}"
+        L".btn.danger:hover{filter:brightness(1.08);}"
+        L".brand{font-size:9.5px;color:var(--brand);letter-spacing:.5px;text-align:right;}"
+        L"::-webkit-scrollbar{width:5px;}::-webkit-scrollbar-thumb{background:rgba(127,127,127,.35);border-radius:9px;}"
+        L".close{position:absolute;top:12px;right:12px;width:24px;height:24px;border-radius:50%;"
+        L"display:grid;place-items:center;font-size:13px;color:var(--sub);cursor:pointer;transition:background .15s,color .15s;}"
+        L".close:hover{background:rgba(127,127,127,.16);color:var(--fg);}"
+        L"</style></head><body>";
+    std::wstring h(fmt);
+    h.replace(h.find(L"data-theme=\"light\""), 18, (std::wstring(L"data-theme=\"") + g_theme + L"\""));   // 主题注入（原写死 light）
+    h += L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},220)\">✕</div>";
+    h += L"<div class=\"top\"><span class=\"badge b" + std::to_wstring(level > 2 ? 2 : level) + L"\">" +
+         (level >= 2 ? L"危险" : (level == 1 ? L"可疑" : L"正常")) + L"</span>"
+         L"<div><div class=\"title\">" + U8W(title) + L"</div>"
+         L"<div class=\"sub\">银狐主防 · 单文件查杀 · " + U8W(type) + L"</div></div></div>";
+    h += L"<div class=\"file\">" + EscHtmlW(fileW) + L"</div>";
+    h += L"<div class=\"mid\"><span class=\"score\">风险分 <b>" + std::to_wstring(score) + L"</b></span></div>";
+    h += L"<div class=\"hits\" id=\"hits\"></div>";
+    if (level >= 1) {
+        h += L"<div class=\"btns\">";
+        h += L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">关闭</div>";
+        h += L"<div class=\"btn danger\" onclick=\"window.chrome.webview.postMessage('probe-clean')\">立即清除</div>";
+        h += L"</div>";
+    } else {
+        h += L"<div class=\"btns\"><div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">关闭</div></div>";
+    }
+    h += L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>";
+    h += L"<script>var HITS=" + U8W(hitsRaw) +
+         L";var box=document.getElementById('hits');var s2={3:'s3',2:'s2',1:'s1',0:'s0'};"
+         L"if(HITS&&HITS.length){HITS.forEach(function(x){var d=document.createElement('div');"
+         L"d.className='hit '+ (s2[x.sev]||'s0');"
+         L"d.innerHTML='<b>'+x.name+'</b><span class=\"d\">'+x.desc+'</span>';box.appendChild(d);});}"
+         L"else{var e=document.createElement('div');e.className='hit';"
+         L"e.innerHTML='<b>未发现可疑特征</b><span class=\"d\">常规结构、名称与内容均未命中检测规则。</span>';box.appendChild(e);}</script>";
+    h += L"</body></html>";
+    return h;
+}
+
+// ===========================================================================
+//  撤销结果卡
+//
+//  用户在告警卡上点「撤销我的处理」→ 服务执行反向回滚 → 这里展示结果。
+//  注意语义：撤销是**把文件还原回"被自动回滚之前"的版本**（即用户当时那份
+//  被引擎判为密文而覆盖掉的内容），不是"让文件变回正常"。卡片文案必须把这个
+//  说清楚，否则用户会以为点完就万事大吉。
+// ===========================================================================
+std::wstring BuildUndoResultHtml(const std::string& undoResp) {
+    // ⚠️ 注意响应有两层 ok：外层是管道帧的 {"cmd":"rollbackundo","ok":true,"report":{...}}，
+    // 外层 ok 只表示"命令送达且被处理"，内层 report.ok 才是"撤销是否成功"。
+    // 直接在整个响应串里找 "ok":true 会命中外层，把失败当成功渲染 —— 故先抠出 report 对象。
+    std::string rep = undoResp;
+    size_t rb = undoResp.find("\"report\":{");
+    if (rb != std::string::npos) {
+        size_t ob = rb + 9, i = ob; int depth = 0;
+        for (; i < undoResp.size(); ++i) {
+            if (undoResp[i] == '{' || undoResp[i] == '[') ++depth;
+            else if (undoResp[i] == '}' || undoResp[i] == ']') { --depth; if (depth == 0) { ++i; break; } }
+        }
+        rep = undoResp.substr(ob, i - ob);
+    }
+    // 服务未响应 / 管道连不上时 undoResp 为空 → 视为失败
+    bool ok = !rep.empty() && (rep.find("\"ok\":true") != std::string::npos);
+    long long restored = sf::JsonGetInt(rep, "restored");
+    long long failed   = sf::JsonGetInt(rep, "failed");
+    std::string reason = sf::JsonGetString(rep, "reason");
+    if (!ok && reason.empty()) reason = "主防服务未响应，撤销未执行";
+
+    const wchar_t* accent = ok ? L"#f5a623" : L"#ff4d57";
+    const wchar_t* soft   = ok ? L"rgba(245,166,35,.16)" : L"rgba(255,77,87,.14)";
+    const wchar_t* line   = ok ? L"rgba(245,166,35,.34)" : L"rgba(255,77,87,.32)";
+    const wchar_t* glow   = ok ? L"rgba(245,166,35,.26)" : L"rgba(255,77,87,.28)";
+    const wchar_t* aura   = ok ? L"rgba(245,166,35,.18)" : L"rgba(255,77,87,.16)";
+
+    std::wstring title = ok ? L"已撤销本次处理" : L"撤销未执行";
+    std::wstring sub;
+    if (ok) {
+        sub = L"已把 " + std::to_wstring(restored) + L" 个文件还原为「处理前」的版本。";
+        if (failed > 0) sub += L"另有 " + std::to_wstring(failed) + L" 个文件还原失败（可能被占用）。";
+    } else {
+        sub = U8W(reason);   // 服务端 JSON 里的中文是 UTF-8
+    }
+
+    std::wstring h =
+        L"<!doctype html><html data-theme=\"light\"><head><meta charset=\"utf-8\"><style>"
+        L"*{margin:0;padding:0;box-sizing:border-box;}"
+        L"html,body{width:100%;height:100%;overflow:hidden;font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,sans-serif;}"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);--brand:rgba(30,34,46,.38);"
+        L"--shadow:rgba(24,30,48,.20);--line:rgba(30,34,46,.10);"
+        L"background:radial-gradient(160px 150px at 50px 50%,var(--aura) 0%,transparent 72%),"
+        L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--line);"
+        L"box-shadow:0 18px 46px var(--shadow);color:var(--fg);display:flex;flex-direction:column;"
+        L"padding:22px 24px;position:relative;gap:9px;justify-content:center;"
+        L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--line:rgba(255,255,255,.10);}"
+        L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
+        L".t{font-size:15px;font-weight:800;display:flex;align-items:center;gap:9px;padding-right:24px;}"
+        L".ic{width:20px;height:20px;flex:0 0 auto;color:var(--accent);}"
+        L".s{font-size:12px;color:var(--sub);line-height:1.7;}"
+        L".btns{display:flex;gap:9px;margin-top:4px;}"
+        L".btn{flex:1;text-align:center;padding:8px 0;border-radius:11px;font-size:12.5px;font-weight:800;"
+        L"cursor:pointer;user-select:none;background:rgba(127,127,127,.12);color:var(--fg);"
+        L"transition:transform .16s cubic-bezier(.22,.61,.36,1),background .18s ease;}"
+        L".btn:hover{background:rgba(127,127,127,.2);}"
+        L".btn:active{transform:scale(.97);}"
+        L".brand{position:absolute;left:24px;bottom:10px;font-size:9.5px;color:var(--brand);letter-spacing:.5px;}"
+        L".close{position:absolute;top:12px;right:12px;width:24px;height:24px;border-radius:50%;"
+        L"display:grid;place-items:center;font-size:13px;color:var(--sub);cursor:pointer;}"
+        L".close:hover{background:rgba(127,127,127,.16);color:var(--fg);}"
+        L"</style></head><body style=\"--accent:";
+    h += accent;
+    h += L";--aura:";
+    h += aura;
+    h += L"\">";
+    h += L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},220)\">✕</div>";
+    h += L"<div class=\"t\"><svg class=\"ic\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\">";
+    if (ok) h += L"<path d=\"M3 12a9 9 0 1 0 3-6.7\"/><path d=\"M3 4v5h5\"/>";
+    else    h += L"<circle cx=\"12\" cy=\"12\" r=\"9\"/><line x1=\"12\" y1=\"8\" x2=\"12\" y2=\"13\"/><circle cx=\"12\" cy=\"16.4\" r=\".9\" fill=\"currentColor\" stroke=\"none\"/>";
+    h += L"</svg>";
+    h += title;
+    h += L"</div><div class=\"s\">";
+    h += sub;
+    h += L"</div>";
+    h += L"<div class=\"btns\"><div class=\"btn\" onclick=\"window.chrome.webview.postMessage('close')\">关闭</div></div>";
+    h += L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>";
+    h += L"</body></html>";
+    (void)soft; (void)line; (void)glow;   // 本轮改用 --aura 单变量，保留色板常量便于后续扩展
+    h.replace(h.find(L"data-theme=\"light\""), 18, (std::wstring(L"data-theme=\"") + g_theme + L"\""));   // 主题注入（原写死 light）
+    return h;
+}
+
+// 引导扇区操作结果卡（「恢复引导」/「信任此变更」执行后反馈）
+// resp 为 bootrestore/bootaccept 管道响应原文；成功显示 okTitle/okSub，失败显示服务端 reason。
+std::wstring BuildBootResultHtml(const std::string& resp,
+                                 const std::wstring& okTitle, const std::wstring& okSub) {
+    // 抠 report 对象（响应外层 {"cmd":...,"ok":true,"report":{...}}，内层才是操作结果）
+    std::string rep = resp;
+    size_t rb = resp.find("\"report\":{");
+    if (rb != std::string::npos) {
+        size_t ob = rb + 9, i = ob; int depth = 0;
+        for (; i < (int)resp.size(); ++i) {
+            if (resp[i] == '{' || resp[i] == '[') ++depth;
+            else if (resp[i] == '}' || resp[i] == ']') { --depth; if (depth == 0) { ++i; break; } }
+        }
+        rep = resp.substr(ob, i - ob);
+    }
+    bool ok = !rep.empty() && (rep.find("\"ok\":true") != std::string::npos);
+    std::string reason = sf::JsonGetString(rep, "reason");
+    if (!ok && reason.empty()) reason = "主防服务未响应，操作未执行";
+    std::wstring title = ok ? okTitle : L"操作未完成";
+    std::wstring sub   = ok ? okSub  : U8W(reason);
+
+    const wchar_t* accent = ok ? L"#1fb574" : L"#ff4d57";
+    const wchar_t* aura   = ok ? L"rgba(31,181,116,.16)" : L"rgba(255,77,87,.16)";
+
+    std::wstring h =
+        L"<!doctype html><html data-theme=\"light\"><head><meta charset=\"utf-8\"><style>"
+        L"*{margin:0;padding:0;box-sizing:border-box;}"
+        L"html,body{width:100%;height:100%;overflow:hidden;font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,sans-serif;}"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);--brand:rgba(30,34,46,.38);"
+        L"--shadow:rgba(24,30,48,.20);--line:rgba(30,34,46,.10);"
+        L"background:radial-gradient(160px 150px at 50px 50%,var(--aura) 0%,transparent 72%),"
+        L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--line);"
+        L"box-shadow:0 18px 46px var(--shadow);color:var(--fg);display:flex;flex-direction:column;"
+        L"padding:22px 24px;position:relative;gap:9px;justify-content:center;"
+        L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--line:rgba(255,255,255,.10);}"
+        L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
+        L".t{font-size:15px;font-weight:800;display:flex;align-items:center;gap:9px;}"
+        L".ic{width:20px;height:20px;color:var(--accent);}"
+        L".s{font-size:12px;color:var(--sub);line-height:1.7;}"
+        L".btns{display:flex;gap:9px;margin-top:6px;}"
+        L".btn{flex:1;text-align:center;padding:9px 0;border-radius:11px;font-size:13px;font-weight:800;cursor:pointer;user-select:none;}"
+        L".btn.ghost{background:rgba(127,127,127,.12);color:var(--fg);}"
+        L".btn.ghost:hover{background:rgba(127,127,127,.22);}"
+        L".brand{position:absolute;left:24px;bottom:10px;font-size:9.5px;color:var(--brand);letter-spacing:.5px;}"
+        L".close{position:absolute;top:12px;right:12px;width:24px;height:24px;border-radius:50%;"
+        L"display:grid;place-items:center;font-size:13px;color:var(--sub);cursor:pointer;}"
+        L".close:hover{background:rgba(127,127,127,.16);color:var(--fg);}"
+        L"</style></head><body style=\"--accent:";
+    h += accent;
+    h += L";--aura:";
+    h += aura;
+    h += L"\">";
+    h += L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},220)\">✕</div>";
+    h += L"<div class=\"t\"><svg class=\"ic\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\" stroke-linejoin=\"round\">";
+    if (ok) h += L"<path d=\"M3 12a9 9 0 1 0 3-6.7\"/><path d=\"M3 4v5h5\"/>";
+    else    h += L"<circle cx=\"12\" cy=\"12\" r=\"9\"/><line x1=\"12\" y1=\"8\" x2=\"12\" y2=\"13\"/><circle cx=\"12\" cy=\"16.4\" r=\".9\" fill=\"currentColor\" stroke=\"none\"/>";
+    h += L"</svg>";
+    h += title;
+    h += L"</div><div class=\"s\">";
+    h += sub;
+    h += L"</div>";
+    h += L"<div class=\"btns\"><div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">关闭</div></div>";
+    h += L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>";
+    h += L"</body></html>";
+    h.replace(h.find(L"data-theme=\"light\""), 18, (std::wstring(L"data-theme=\"") + g_theme + L"\""));   // 主题注入（原写死 light）
+    return h;
+}
+
+// 清除结果卡（cleanResp 为服务端响应的 JSON 原文）
+std::wstring BuildProbeCleanHtml(const std::string& cleanResp, const std::wstring& pathW) {
+    std::string cleanObj = "{}";
+    size_t hb = cleanResp.find("\"clean\":{");
+    if (hb != std::string::npos) {
+        size_t ob = hb + 8, i = ob; int depth = 0;
+        for (; i < cleanResp.size(); ++i) {
+            if (cleanResp[i] == '{' || cleanResp[i] == '[') ++depth;
+            else if (cleanResp[i] == '}' || cleanResp[i] == ']') { --depth; if (depth == 0) { ++i; break; } }
+        }
+        cleanObj = cleanResp.substr(ob, i - ob);
+    }
+    std::wstring h =
+        L"<!doctype html><html data-theme=\"light\"><head><meta charset=\"utf-8\"><style>"
+        L"*{margin:0;padding:0;box-sizing:border-box;}"
+        L"html,body{width:100%;height:100%;overflow:hidden;font-family:\"Microsoft YaHei\",\"Segoe UI\",system-ui,sans-serif;}"
+        L"body{--bg1:#ffffff;--bg2:#eef0f5;--fg:#242833;--sub:rgba(30,34,46,.58);--brand:rgba(30,34,46,.38);"
+        L"--shadow:rgba(24,30,48,.20);--line:rgba(30,34,46,.10);"
+        L"background:radial-gradient(160px 150px at 50px 50%,rgba(35,190,120,.12) 0%,transparent 72%),"
+        L"linear-gradient(158deg,var(--bg1),var(--bg2));border-radius:18px;border:1px solid var(--line);"
+        L"box-shadow:0 18px 46px var(--shadow);color:var(--fg);display:flex;flex-direction:column;"
+        L"padding:22px 24px;position:relative;gap:10px;justify-content:center;"
+        L"animation:rise .3s cubic-bezier(.22,.61,.36,1) both;}"
+        L"[data-theme=\"dark\"] body{--bg1:#15161d;--bg2:#0f0f14;--fg:#e8eaf2;--sub:rgba(232,234,242,.60);"
+        L"--brand:rgba(232,234,242,.40);--shadow:rgba(0,0,0,.55);--line:rgba(255,255,255,.10);}"
+        L"@keyframes rise{from{opacity:0;transform:translateY(10px) scale(.99);}to{opacity:1;transform:none;}}"
+        L".t{font-size:15px;font-weight:800;display:flex;align-items:center;gap:9px;}"
+        L".ic{width:20px;height:20px;color:#17975d;}"
+        L".s{font-size:12px;color:var(--sub);line-height:1.7;}"
+        L".stat{font-size:12px;color:var(--sub);}"
+        L".stat b{color:var(--fg);font-weight:800;}"
+        L".row{display:flex;gap:14px;flex-wrap:wrap;margin-top:2px;}"
+        L".chip{font-size:11.5px;border-radius:999px;padding:4px 10px;background:rgba(127,127,127,.09);color:var(--fg);}"
+        L".chip.ok{background:rgba(35,190,120,.14);color:#14975c;}"
+        L".chip.bad{background:rgba(235,68,60,.14);color:#e03225;}"
+        L".btns{display:flex;gap:9px;margin-top:6px;}"
+        L".btn{flex:1;text-align:center;padding:9px 0;border-radius:11px;font-size:13px;font-weight:800;cursor:pointer;user-select:none;}"
+        L".btn.ghost{background:rgba(127,127,127,.12);color:var(--fg);}"
+        L".btn.ghost:hover{background:rgba(127,127,127,.22);}"
+        L".brand{position:absolute;left:24px;bottom:10px;font-size:9.5px;color:var(--brand);letter-spacing:.5px;}"
+        L".close{position:absolute;top:12px;right:12px;width:24px;height:24px;border-radius:50%;"
+        L"display:grid;place-items:center;font-size:13px;color:var(--sub);cursor:pointer;transition:background .15s,color .15s;}"
+        L".close:hover{background:rgba(127,127,127,.16);color:var(--fg);}"
+        L"</style></head><body>"
+        L"<div class=\"close\" onclick=\"document.body.classList.add('hide');setTimeout(function(){window.chrome.webview.postMessage('close')},220)\">✕</div>"
+        L"<div class=\"t\"><svg class=\"ic\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"><path d=\"M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3Z\"/><path d=\"M8.6 11.6l2.4 2.4 4.4-4.6\"/></svg>查杀任务已处理</div>"
+        L"<div class=\"s\">已对该文件尝试清除：终止关联进程、删除文件本体及 NTFS 附加数据流。下方为处理结果。</div>";
+    h += L"<div class=\"file\" style=\"font-size:11.5px;color:var(--fg);background:rgba(127,127,127,.09);border-radius:9px;padding:7px 10px;word-break:break-all;\">" +
+         EscHtmlW(pathW) + L"</div>";
+    h += L"<div class=\"row\"><span class=\"chip ok\">已删除 <b id=\"cDel\">0</b></span>"
+         L"<span class=\"chip bad\">删除失败 <b id=\"cFail\">0</b></span>"
+         L"<span class=\"chip\">终止进程 <b id=\"cKill\">0</b></span>"
+         L"<span class=\"chip\">连坐 DLL <b id=\"cDll\">0</b></span></div>";
+    h += L"<div class=\"btns\"><div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">关闭</div></div>";
+    h += L"<div class=\"brand\">银狐主防 · SilverFox Guard</div>";
+    h += L"<script>var C=" + U8W(cleanObj) +
+         L";function s(n,d){var e=document.getElementById(n);if(e)e.textContent=(typeof d==='number'?d:0);}"
+         L"s('cDel',C.deleted);s('cFail',(typeof C.failed==='number'?C.failed:(typeof C.deferred==='number'?C.deferred:0)));"
+         L"s('cKill',C.killed);s('cDll',C.extraDlls);</script>";
+    h += L"</body></html>";
+    h.replace(h.find(L"data-theme=\"light\""), 18, (std::wstring(L"data-theme=\"") + g_theme + L"\""));   // 主题注入（原写死 light）
+    return h;
+}
+
+// 右键自定义查杀主入口（explorer 拉起，用户会话，无需跨会话 token）
+int RunProbeToast(const std::wstring& fileW) {
+    g_probeIn = fileW;
+    g_probePath = fileW;
+    // 1) 同步向服务管道请求判定（服务以 SYSTEM 执行，可读受保护文件；大安装包解包可能数十秒，逐秒重试）
+    std::string resp;
+    for (int i = 0; i < 60 && resp.empty(); ++i) {
+        resp = ProbeVerdictRequest(fileW);
+        if (!resp.empty()) break;
+        Sleep(500);
+    }
+    int level = sf::JsonGetInt(resp, "level");
+    int ratio = sf::JsonGetInt(resp, "score");
+    std::string type = sf::JsonGetString(resp, "type");
+    std::string title = sf::JsonGetString(resp, "title");
+    if (title.empty()) title = (level == 2) ? "疑似危险文件" : (level == 1 ? "存在可疑迹象" : "未发现可疑特征");
+    std::string hitsRaw = ExtractHitsRaw(resp);
+
+    // 2) WebView2 宿主初始化（同 RunToast / RunPrewarm 管线）
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", L"--no-sandbox");
+    g_theme = GetSystemTheme();
+    g_closing = false; g_fallbackDone = false; g_prewarm = false;
+    g_html = BuildProbeHtml(level, ratio, type, title, g_probeIn, hitsRaw);
+
+    const int W = 400, H = 430, M = 18;
+    int x, y; GetDockPos(x, y, W, H, M);
+    WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"SFProbeToast";
+    wc.hbrBackground = CreateSolidBrush(g_theme == L"dark" ? RGB(15, 15, 20) : RGB(238, 240, 245));
+    RegisterClassExW(&wc);
+    g_posX = x; g_posY = y; g_w = W; g_h = H;
+    RECT scr; GetWindowRect(GetDesktopWindow(), &scr);
+    int ox = scr.right + W + 40, oy = scr.bottom + H + 40;
+    g_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"SFProbeToast", L"",
+        WS_POPUP, ox, oy, W, H, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!g_hwnd) { CoUninitialize(); return 1; }
+    int corner = 2; DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof(corner));
+    ShowWindow(g_hwnd, SW_SHOW);
+
+    char ep[MAX_PATH]; GetModuleFileNameA(nullptr, ep, MAX_PATH);
+    std::string d = ep; size_t q = d.find_last_of('\\');
+    std::wstring runtime = (q != std::string::npos) ? U8W(d.substr(0, q + 1) + "WebView2Runtime") : L"";
+    wchar_t envbuf[512] = {0};
+    if (GetEnvironmentVariableW(L"SF_WV2_DIR", envbuf, 512)) runtime = envbuf;
+    wchar_t pidbuf[32]; swprintf_s(pidbuf, L"_%lu", (unsigned long)GetCurrentProcessId());
+    std::wstring userData = Wv2BaseDir() + L"\\WV2Data" + pidbuf;
+
+    g_envH = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+        [](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            if (FAILED(hr)) { g_lastHr = hr; WriteDbg(L"[probe] env FAILED\r\n"); FallbackMessage(); return S_OK; }
+            g_ctrlH = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(OnController);
+            env->CreateCoreWebView2Controller(g_hwnd, g_ctrlH.Get());
+            return S_OK;
+        });
+    HRESULT hrc = CreateCoreWebView2EnvironmentWithOptions(
+        runtime.empty() ? nullptr : runtime.c_str(), userData.c_str(), nullptr, g_envH.Get());
+    if (FAILED(hrc)) { g_lastHr = hrc; WriteDbg(L"[probe] env fatal\r\n"); FallbackMessage(); CoUninitialize(); return 0; }
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    CoUninitialize();
+    return 0;
+}
 }  // namespace sf

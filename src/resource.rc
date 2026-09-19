@@ -1,5 +1,6 @@
 #define IDI_SHIELD 101
-IDI_SHIELD ICON "D:\\silverfox-envscan\\shield.ico"
-// 说明：VersionInfo 版本资源由构建脚本在编译后用 update_ver.exe 注入
+IDI_SHIELD ICON "shield.ico"
+// 图标文件位于仓库根目录（shield.ico）。rc.exe 以当前工作目录解析相对路径，
+// build.sh 在仓库根目录执行，故此处直接写文件名。
+// 说明：VersionInfo 版本资源由构建脚本在编译后注入
 // （BeginUpdateResource/UpdateResource 系统 API，规避 cvtres 对 RT_VERSION 的目录树合并问题）。
-// 顺序：cl 编译 → update_ver 注入版本 → signtool 签名 → NSIS 打包。

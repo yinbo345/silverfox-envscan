@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <cstddef>
 
 // ============================================================================
@@ -175,7 +175,7 @@ inline constexpr std::size_t REG_RUN_KEYS_N = sizeof(REG_RUN_KEYS) / sizeof(REG_
 
 // 注册表值名/数据中需警惕的片段
 // 注：已移除 "silverfox"——那是安全厂商给木马家族起的代号，真实样本不会自称 silverfox，
-// 反而与我们自己的程序名 SilverFoxEnvScanSvc 撞名，造成自误报。自排除另有统一白名单兜底。
+// 反而与我们自己的程序名 SilverFoxGuardSvc 撞名，造成自误报。自排除另有统一白名单兜底。
 inline constexpr const char* REG_VALUE_FRAGMENTS[] = {
     "xfolder32", "foxservice", "svchost64",
     "GitMndsetup", "WhatsAppBackup", "nvsc", "temp.key",

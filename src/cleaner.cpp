@@ -1,4 +1,4 @@
-// cleaner.cpp — 可疑文件清除（强制项）：最高权限删除 + 解除占用 + 载荷 DLL 连坐 + 进度落盘
+﻿// cleaner.cpp — 可疑文件清除（强制项）：最高权限删除 + 解除占用 + 载荷 DLL 连坐 + 进度落盘
 //
 // 权限来源：本代码运行在 LocalSystem 服务进程内，等价于「最高权限」——
 //   * 可结束任意会话（含用户桌面会话）中的任意进程；
@@ -45,8 +45,8 @@ static std::wstring ProgressPathW() {
     wchar_t p[MAX_PATH] = {0};
     std::wstring dir;
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, p)) && p[0])
-        dir = std::wstring(p) + L"\\SilverFoxEnvScan";
-    else dir = L"C:\\ProgramData\\SilverFoxEnvScan";
+        dir = std::wstring(p) + L"\\SilverFoxGuard";
+    else dir = L"C:\\ProgramData\\SilverFoxGuard";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\clean_progress.txt";
 }
@@ -151,6 +151,23 @@ struct HolderProc {
     HANDLE handle = nullptr;   // 已打开的进程句柄（调用方负责 CloseHandle）
 };
 
+// 系统主机进程名单：这些进程被杀会造成系统级副作用（lsass 蓝屏、explorer 桌面消失、
+// winlogon 登录失效、svchost 服务中断），【任何清除路径都不得结束它们】。
+// 载荷 DLL 即使被注入进这些进程，也只能"删文件"（硬删/重启登记），宿主进程保留。
+static const char* kProtectedHostNames[] = {
+    "svchost.exe", "explorer.exe", "winlogon.exe", "lsass.exe", "csrss.exe",
+    "services.exe", "wininit.exe", "dwm.exe", "spoolsv.exe", "sihost.exe",
+    "taskhostw.exe", "runtimebroker.exe", "searchhost.exe", "shell experience host.exe",
+    "fontdrvhost.exe", "smss.exe", "conhost.exe", "audiodg.exe",
+};
+
+// 进程名是否属于【受保护系统主机】（大小写不敏感，不含扩展名差异）
+static bool IsProtectedHostProc(const std::string& nameLower) {
+    for (const char* hn : kProtectedHostNames)
+        if (nameLower == hn) return true;
+    return false;
+}
+
 // 该进程是否「正在运行某文件」或「已把该文件作为模块加载」（DLL 被占用的情形）
 static bool ProcessUsesFile(HANDLE hProc, const std::string& targetLower) {
     char img[MAX_PATH * 2] = {0};
@@ -184,6 +201,7 @@ static std::vector<HolderProc> FindHolders(const std::string& target) {
         do {
             const DWORD pid = pe.th32ProcessID;
             if (pid == 0 || pid == 4 || pid == self) continue;   // Idle / System / 自己
+            if (IsProtectedHostProc(to_lower(std::string(pe.szExeFile)))) continue;   // 系统主机进程绝不杀（注入 DLL 走删文件/延迟路径）
             // 同一进程可能已记录（多个目标共用），避免重复
             bool dup = false;
             for (const auto& h : out) if (h.pid == pid) { dup = true; break; }
@@ -214,6 +232,7 @@ static std::vector<HolderProc> FindHolders(const std::string& target) {
                 if (Process32First(snap2, &pe2)) {
                     do {
                         if (to_lower(pe2.szExeFile) != baseL) continue;
+                        if (IsProtectedHostProc(to_lower(std::string(pe2.szExeFile)))) continue;   // 兜底同样不杀主机进程
                         if (pe2.th32ProcessID == 0 || pe2.th32ProcessID == 4 || pe2.th32ProcessID == self) continue;
                         bool dup = false;
                         for (const auto& h : out) if (h.pid == pe2.th32ProcessID) { dup = true; break; }
@@ -409,7 +428,29 @@ CleanReport CleanFiles(const std::vector<std::string>& targetsIn) {
         rep.items.push_back(it);
     }
 
-    WriteCleanProgress("done", (int)pending.size(), (int)pending.size(), "");
+    // ---- 阶段 4：防复活复查（银狐常留守护线程/子进程，主载荷被删后几秒内重新写回）----
+    // 等内核充分释放后，对「本次已删成」的目标逐一复查：若又冒出来 → 二次硬删；
+    // 二次删除仍失败 → 该条目改为 failed（提示未能根除，交给高级清除接管）。
+    if (!targets.empty()) {
+        WriteCleanProgress("recheck", 0, (int)targets.size(), "");
+        Sleep(2000);
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const std::string& t = targets[i];
+            WriteCleanProgress("recheck", (int)i, (int)targets.size(), t);
+            if (GetFileAttributesA(t.c_str()) == INVALID_FILE_ATTRIBUTES) continue;   // 已无 → 无需复查
+            CleanItemResult* prev = nullptr;
+            for (auto& it : rep.items) if (it.path == t) { prev = &it; break; }
+            if (!prev || prev->action != "deleted") continue;   // 只复查「已删成」的（failed/deferred 另有通道）
+            if (TryDeleteOnce(t)) {
+                prev->reason += "；防复活复查发现重新生成，已二次删除";
+            } else if (GetFileAttributesA(t.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                prev->action = "failed";
+                prev->reason += "；防复活复查发现重新生成且二次删除失败（疑有守护进程，请用「高级清除」）";
+                ++rep.failed; --rep.deleted;
+            }
+        }
+        WriteCleanProgress("done", (int)pending.size(), (int)pending.size(), "");
+    }
     return rep;
 }
 
@@ -712,6 +753,176 @@ static int KillHardByName(const std::string& targetPath, std::vector<std::string
 
 // 高级清除主入口：输入普通清除后仍失败的清单，逐一「遏制 → 硬删」；
 // 并扩展收集【同目录衍生物】（同批释放的随机名载荷）一并遏制+硬删，防止样本被重启/重新拉起。
+// ---------------------------------------------------------------------------
+//  P4 清除加强：ADS 流级清除 + 持久化锚点清除
+// ---------------------------------------------------------------------------
+
+// 宽→窄路径（日志用；cleaner.cpp 内部仅有 A2W，补一个反向）
+static std::string W2A(const wchar_t* w) {
+    if (!w || !w[0]) return std::string();
+    int n = WideCharToMultiByte(CP_ACP, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s; if (n > 1) { s.resize(n - 1); WideCharToMultiByte(CP_ACP, 0, w, -1, &s[0], n, nullptr, nullptr); }
+    return s;
+}
+
+// ADS 流级清除：银狐借 NTFS 备用数据流藏载荷（主文件伪装正常），此时只删流不动主文件。
+// 仅删「可疑具名流」，Zone.Identifier/Encryptable/Smartlocker/Win32App 等系统或软件私有流保留。
+// 返回删除的流数量。
+static int CleanAdsOf(const std::string& path) {
+    std::wstring wpath = A2W(path);
+    if (wpath.empty()) return 0;
+    int removed = 0;
+    WIN32_FIND_STREAM_DATA fsd{};
+    HANDLE h = FindFirstStreamW(wpath.c_str(), FindStreamInfoStandard, &fsd, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        std::wstring ln = fsd.cStreamName;
+        while (!ln.empty() && ln[0] == L':') ln.erase(ln.begin());
+        size_t tail = ln.find(L":$data");
+        if (tail != std::wstring::npos) ln = ln.substr(0, tail);
+        if (ln.empty() || ln == L"$data") continue;
+        std::wstring ll = ln;
+        for (auto& c : ll) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+        if (ll.find(L"zone.identifier") != std::wstring::npos) continue;
+        if (ll.find(L"encryptable") != std::wstring::npos) continue;
+        if (ll.find(L"smartlocker") != std::wstring::npos) continue;
+        if (ll.find(L"win32app") != std::wstring::npos) continue;
+        if (ll.find(L"oecustomproperty") != std::wstring::npos) continue;
+        if (ll.find(L"summaryinformation") != std::wstring::npos) continue;
+        std::wstring adsFull = wpath + L":" + ln;
+        if (DeleteFileW(adsFull.c_str())) ++removed;
+    } while (FindNextStreamW(h, &fsd));
+    FindClose(h);
+    return removed;
+}
+
+// 注册表 Run/RunOnce 值清理：值数据包含样本路径（小写比对）则删除该值
+static void EraseRunEntry(HKEY root, const char* subkey, const std::vector<std::string>& lows) {
+    HKEY hk;
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, &hk) != ERROR_SUCCESS) return;
+    DWORD nVals = 0, maxName = 256, maxData = 4096;
+    RegQueryInfoKeyA(hk, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &nVals, &maxName, &maxData, nullptr, nullptr);
+    for (DWORD i = 0; i < nVals; ++i) {
+        std::vector<char> vn(maxName + 1); std::vector<char> vd(maxData + 1);
+        DWORD vnS = (DWORD)vn.size(), vdS = (DWORD)vd.size(), type = 0;
+        if (RegEnumValueA(hk, i, vn.data(), &vnS, nullptr, &type, (LPBYTE)vd.data(), &vdS) != ERROR_SUCCESS) continue;
+        std::string dl = LowerA(std::string(vd.data()));
+        for (const auto& low : lows) {
+            if (!low.empty() && dl.find(low) != std::string::npos) {
+                RegDeleteValueA(hk, vn.data());
+                LogDbg("[clean-persist] Run 值删除: " + std::string(subkey) + "[" + vn.data() + "] = " + vd.data());
+                break;
+            }
+        }
+    }
+    RegCloseKey(hk);
+}
+
+// Startup 文件夹：解析 .lnk 目标，指向样本则整条删除
+static void EraseStartupLinks(const std::vector<std::string>& lows, const std::wstring& dir) {
+    std::error_code ec;
+    try {
+        for (auto it = fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec);
+             it != fs::directory_iterator(); ++it) {
+            std::error_code e2;
+            if (!it->is_regular_file(e2)) continue;
+            std::wstring p = it->path().wstring();
+            if (p.size() < 5 || _wcsicmp(p.substr(p.size() - 4).c_str(), L".lnk") != 0) continue;
+            IShellLinkW* sl = nullptr;
+            if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&sl)) || !sl) continue;
+            IPersistFile* pf = nullptr;
+            if (SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && pf) {
+                if (SUCCEEDED(pf->Load(p.c_str(), STGM_READ))) {
+                    wchar_t target[MAX_PATH * 2] = {0};
+                    if (SUCCEEDED(sl->GetPath(target, MAX_PATH * 2, nullptr, SLGP_RAWPATH)) && target[0]) {
+                        std::string tl = LowerA(W2A(target));
+                        for (const auto& low : lows) {
+                            if (!low.empty() && tl.find(low) != std::string::npos) {
+                                _wremove(p.c_str());
+                                LogDbg("[clean-persist] Startup .lnk 删除: " + W2A(p.c_str()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                pf->Release();
+            }
+            sl->Release();
+        }
+    } catch (...) {}
+}
+
+// Windows 服务清理：ImagePath 指向样本 → 停止服务并删除服务键
+static void DeleteServicePersistence(const std::vector<std::string>& lows) {
+    HKEY hk;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services", 0,
+                      KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, &hk) != ERROR_SUCCESS) return;
+    DWORD idx = 0; char name[128];
+    for (;;) {
+        DWORD nl = sizeof(name);
+        if (RegEnumKeyExA(hk, idx, name, &nl, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        ++idx;
+        HKEY sk;
+        if (RegOpenKeyExA(hk, name, 0, KEY_READ | KEY_WOW64_64KEY, &sk) != ERROR_SUCCESS) continue;
+        char img[MAX_PATH * 2] = {0}; DWORD imgs = sizeof(img); DWORD itype = 0;
+        bool match = false;
+        if (RegQueryValueExA(sk, "ImagePath", nullptr, &itype, (LPBYTE)img, &imgs) == ERROR_SUCCESS && img[0]) {
+            std::string il = LowerA(std::string(img));
+            for (const auto& low : lows) if (!low.empty() && il.find(low) != std::string::npos) { match = true; break; }
+        }
+        RegCloseKey(sk);
+        if (!match) continue;
+        // 停止该服务（避免删键时被 SCM 拒绝 / 复活）
+        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (scm) {
+            SC_HANDLE svc = OpenServiceA(scm, name, SERVICE_STOP | DELETE);
+            if (svc) {
+                SERVICE_STATUS ss{};
+                ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+                DeleteService(svc);
+                CloseServiceHandle(svc);
+            }
+            CloseServiceHandle(scm);
+        }
+        // 兜底：直接删注册表服务键（若 OpenService 失败）
+        RegDeleteTreeA(hk, name);
+        LogDbg("[clean-persist] 服务删除: " + std::string(name) + " (" + img + ")");
+    }
+    RegCloseKey(hk);
+}
+
+// 入口：对全部样本路径清除持久化锚点（每次高级清除收尾调用）
+static void CleanPersistenceFor(const std::vector<std::string>& targets) {
+    std::vector<std::string> lows;
+    for (const auto& t : targets) {
+        std::string p = t;
+        size_t q = p.find('"');
+        if (q != std::string::npos) {
+            size_t q2 = p.find('"', q + 1);
+            p = p.substr(q + 1, q2 == std::string::npos ? std::string::npos : q2 - q - 1);
+        } else {
+            size_t sp = p.find(' ');
+            if (sp != std::string::npos) p = p.substr(0, sp);
+        }
+        std::string l = LowerA(p);
+        if (l.size() > 3) lows.push_back(l);
+    }
+    if (lows.empty()) return;
+    // ① Run / RunOnce：HKCU + HKLM
+    EraseRunEntry(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", lows);
+    EraseRunEntry(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", lows);
+    EraseRunEntry(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", lows);
+    EraseRunEntry(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", lows);
+    // ② 服务
+    DeleteServicePersistence(lows);
+    // ③ Startup 快捷方式（当前用户 + 公共）
+    {
+        wchar_t p[MAX_PATH] = {0};
+        if (SHGetFolderPathW(nullptr, CSIDL_STARTUP, nullptr, 0, p) == S_OK && p[0]) EraseStartupLinks(lows, p);
+        if (SHGetFolderPathW(nullptr, CSIDL_COMMON_STARTUP, nullptr, 0, p) == S_OK && p[0]) EraseStartupLinks(lows, p);
+    }
+}
+
 CleanReport AdvancedCleanFiles(const std::vector<std::string>& targetsIn) {
     CleanReport rep;
     // 去重 + 去空
@@ -768,6 +979,15 @@ CleanReport AdvancedCleanFiles(const std::vector<std::string>& targetsIn) {
         }
         rep.items.push_back(it);
     }
+    // 收尾 ①：ADS 流级清除（主文件删不掉/合法宿主时，流里的载荷单独拔除）
+    for (const auto& t : targets) {
+        if (IsSelfPath(t)) continue;
+        if (GetFileAttributesA(t.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        int rm = CleanAdsOf(t);
+        if (rm > 0) LogDbg("[clean-ads] " + std::to_string(rm) + " stream(s) removed from " + t);
+    }
+    // 收尾 ②：持久化锚点清除（Run/服务/Startup，防下次开机复活）
+    CleanPersistenceFor(targets);
     WriteCleanProgress("done", (int)targets.size(), (int)targets.size(), "");
     return rep;
 }
@@ -796,6 +1016,7 @@ static bool IsCleanProcTarget(const Finding& f) {
         "发现已知银狐木马进程", "进程为双后缀诱饵程序",
         "随机名进程位于可疑落地目录", "可写目录下存在随机名可执行文件",
         "合法程序被利用进行 DLL 侧加载",            // path 即恶意 DLL 全路径，删 DLL 不删宿主
+        "系统主机进程被注入可疑 DLL",              // path 即被注入的 DLL 全路径：只删 DLL，宿主受保护不杀
     };
     for (const char* t : killTitles) if (f.title == t) return true;
     return false;   // 「进程路径含银狐可疑片段」不足以单独判删，避免误删含同名片段的合法程序

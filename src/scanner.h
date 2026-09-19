@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <string>
 #include <vector>
 #include <mutex>
@@ -23,9 +23,8 @@ struct ScanResult {
     // 两态：normal（环境正常）/ infected（环境异常，即疑似中银狐）
     std::string status;
     int score = 0;          // 风险分：按证据强度赋权累计（高=60/中=30/低=10 基线 + 上下文微调）
-    bool hardProof = false; // 是否命中铁证（已知 C2 活跃连接 / 已知银狐进程 / 银狐标记文件 / 自身完整性失败）
+    bool hardProof = false; // 是否命中铁证（已知 C2 活跃连接 / 已知银狐进程 / 银狐标记文件）
     std::string engine;     // 引擎版本
-    bool selfCheck = true;  // 程序自身完整性校验是否通过（自保）
     std::vector<Finding> findings;
     std::string error;      // 扫描过程致命错误（若有）
 };
@@ -38,11 +37,23 @@ extern std::mutex g_resultMutex;
 void RunFullScan();
 
 // 快速清除预扫：只扫进程+文件（清除目标的全部来源），秒级返回
+// ⚠️ 会做磁盘遍历（递归 Desktop/Downloads/Temp 等落点）——**只允许「清除前预扫」调用**。
+//    定时器请用 RunGuardTick()。
 void RunQuickScan();
+
+// 轻量巡检（定时器专用）：进程 + 注入 + 注册表 + 服务 + 计划任务。
+// 纯内存 / 注册表读取，**零磁盘遍历**，秒级完成。结果合并进 g_result
+// （保留上一轮全盘扫出的「文件」类 finding，不被冲掉）。
+void RunGuardTick();
 
 // 初始化 COM 等（main 启动时调用一次）
 void ScannerInit();
 void ScannerCleanup();
+
+// P3 主动防御：单文件快速启发式判定（供 WMI 进程创建监听调用）。
+// 与全盘文件扫描共享同一套启发式（随机名/落地位置/家族串/PE 静态/签名），
+// 返回：0=正常或豁免；1=中危旁证；2=高危（随机名+可疑位置+PE 异常或盘根或家族特征串）。
+int QuickProbeExecutable(const std::string& path);
 
 // 大小写不敏感子串查找（ASCII）
 bool ci_contains(const std::string& hay, const std::string& needle);

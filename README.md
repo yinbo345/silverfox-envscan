@@ -1,60 +1,68 @@
-# SilverFoxEnvScan — 银狐环境检测程序（开源版）
+# 银狐防护主防程序（SilverFoxGuardSvc）
 
-针对「银狐 / 游蛇（Silver Fox / APT-Q-27）」远控木马的 Windows 环境检测与清除工具。单个 C++ EXE，同时作为：
+银狐防护的**系统级防线**：浏览器扩展管网页，主防程序管系统。这是一款独立的 Windows 主防程序——后台以 Windows 服务常驻（`SilverFoxGuardSvc.exe`），自带 WebView2 通知窗口、托盘式图形主界面，并经 Native Messaging 私有管道与[浏览器扩展](https://github.com/yinbo345/silverfox-guard)联动。
 
-- **Windows 常驻服务**（`SilverFoxEnvScanSvc`）：每 3 分钟巡检本机九大维度
-- **浏览器 Native Messaging 宿主**：与「银狐防护」浏览器扩展联动（无 TCP 端口，命名管道通信）
+当前以**预览版2**形态发布，安装包可从[官网](https://silverfoxguard.dpdns.org/)下载。
 
-配套浏览器扩展：<https://github.com/yinbo345/silverfox-guard>
+## 它防什么
 
-## 检测维度（九大模块）
+- **实时行为防护（四事件源）**：进程行为监视、文件落地捕获、自启动项监视、引导扇区防护——命中威胁先自动拦截，再在屏幕右下角弹出处理卡片（它在干什么 → 已自动拦截 → 是否撤销）；撤销即一键还原，误拦不伤文件；
+- **勒索加密拦截**：截获混合加密的密钥落盘、识别批量加密改写，先回滚被加密文件再通知；配合快照机制，中招文件可自动恢复；
+- **MBR 引导扇区防护**：安装时建立引导扇区基线，持续监视篡改，被改写即刻告警并可一键恢复；
+- **系统主机进程注入检测**：探测 explorer / svchost / lsass 等系统进程里被注入的无签名恶意 DLL；
+- **定时扫描**：快扫约 3 分钟一轮、全盘 6 小时一轮、开机 2 分钟内完成首轮；
+- **GPU 深度内容扫描**（可开关）：对用户可写目录的可执行/脚本文件批量匹配家族特征字节串，抓"名字正常但内容是银狐"的改名样本；
+- **一键清除 / 高级清除**：普通清除失败自动升级高级清除——遏制（强杀进程树）→ 夺权（解 ACL）→ 硬删（POSIX 删除 + 重启登记）→ 连坐（清除同目录随机名衍生物）；每次清除写入「清除记录」。
 
-进程 / 注册表 Run 键 / 系统服务 / 计划任务 / 网络连接 / 文件系统（含 ADS 备用数据流、双后缀、畸形文件名）/ Windows Defender 状态 / Hosts 劫持 / WMI 事件订阅（持久化）。
+## 关于本开源版本
 
-评分模型：铁证直判（C2 活跃连接 / 已知样本进程 / 标记文件）+ 旁证零贡献 + 同类只算一次 + 分数封顶。
+本仓库是主防程序的**开源版本**。与官方发行版相比，**不含服务自保护逻辑**，包括：
 
-## 清除能力
+- 定时自保复核（服务注册项检查 + 程序文件 ACL 加固）；
+- 服务被删除后的自动重建；
+- SCM 失败自动重启配置；
+- 自身完整性校验（安装时写入哈希基线、运行时比对）；
+- NM 宿主进程触发的服务自愈。
 
-- **普通清除**：结束占用进程 → 删除载荷与伴生 DLL → 失败登记重启删除（`PendingFileRenameOperations`，`\??\` NT 路径）
-- **高级清除**：按基名强杀全部同名实例与子进程树（两轮快照防复活）→ 清属性 + 夺权解 DACL → 硬删（POSIX 语义）→ 跨 `Temp` / `Roaming` / `Downloads` / `Public` / `ProgramData` 连坐清除随机名衍生物
+其余防护、检测、清除、回滚功能与官方发行版一致。这样做的目的：防自保护对抗细节（重建服务、ACL 加固等手法）可能被恶意软件作者研究用于反制。如果你要自行构建并部署到生产环境，建议自行补上需要的自保护逻辑。
+
+## 目录结构
+
+```
+├── build.sh            # 构建脚本（MSVC，静态单文件 /MT）
+├── data/
+│   ├── probe_rules.txt     # 单文件查杀规则库（外置，可热更新）
+│   ├── behavior_rules.txt  # 行为判定规则库（外置，可热更新）
+│   └── rollback_rules.txt  # 回滚判定规则库
+└── src/
+    ├── main.cpp            # 入口：命令行 / 服务模式 / NM 宿主模式
+    ├── service.cpp/h       # SCM 服务控制 / 守护循环 / 命名管道 / 安装
+    ├── scanner.cpp/h       # 扫描引擎：两态评分（正常/感染）+ 铁证直判
+    ├── behavior.cpp/h      # 行为判定：四事件源归一化 + 评分 + 信誉
+    ├── rollback.cpp/h      # 勒索回滚：密钥截获 / 双信号判定 / 快照恢复
+    ├── bootguard.cpp/h     # MBR 引导扇区防护：基线 + 边沿监视 + 恢复
+    ├── cleaner.cpp/h       # 一键清除 / 高级清除
+    ├── matcher.cpp/h       # AC 自动机特征匹配
+    ├── compute.cpp/h       # GPU 加速扫描（D3D11 批量字节串匹配）
+    ├── probe.cpp/h         # 单文件查杀（右键菜单调起）
+    ├── gui.cpp/h           # WebView2 通知窗口 + 右下角卡片
+    ├── toast.cpp/h         # 9 种告警卡片（深浅色主题）
+    ├── common.cpp/h        # 公共模块：JSON / 帧IO / SHA-256 / 管道
+    └── shell/              # Win11 右键一级菜单（稀疏包 IExplorerCommand）
+```
 
 ## 构建
 
-依赖：
+1. 安装 MSVC BuildTools 2022 与 Windows SDK；
+2. 从 nuget 下载 `microsoft.web.webview2 1.0.2651.64`，修改 `build.sh` 顶部 `WV2` 指向其解压目录；
+3. 仓库根目录执行 `bash build.sh`，产物在 `dist/`。
 
-- MSVC BuildTools 2022（MSVC v143，x64）
-- Windows SDK 10.0.26100.0
-- WebView2 SDK（`nuget install microsoft.web.webview2 -Version 1.0.2651.64`）
-- （打包安装包）NSIS 3.x + 7-Zip
+程序本体为静态链接（/MT），无第三方运行库依赖；运行时规则在 `data/` 目录，可热更新。
 
-```bash
-bash build_envscan.sh     # 完整构建：编译 → 注入版本 → （可选签名）→ 安装包
-# 或
-build.bat                 # 仅编译（旧脚本，产物在 dist\）
-```
+## 隐私
 
-源码为 UTF-8，`cl` 参数已带 `/utf-8`。未配置代码签名证书时构建脚本会跳过签名并打印警告（功能不受影响）。
+主防程序不采集、不上传任何用户数据；与扩展的联动经命名管道完成，不开放任何网络端口。
 
-## 演示样本
+## 许可
 
-`samples-demo.ps1` 一键释放全套无害对抗样本（`ping.exe` 改名），用于验证检测 / 普通删除 / 高级删除全链路：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File samples-demo.ps1
-```
-
-包含：已知银狐进程名、双后缀诱饵、深层随机名、复活守护 + ACL 压制、同名多实例、快速轮换 PID、独占锁持有者，以及**跨目录衍生物**（散布 Temp / Roaming / Downloads / Public / ProgramData 五个高发区）。
-
-## 开源版说明
-
-本仓库为**开源版**，与作者自用版本的区别：**自保模块已整体移除**，包括——
-
-- 服务被删除后的自动重建（`EnsureServiceRegistered` / NM 宿主自愈）
-- 程序文件 ACL 加固（`HardenFileAcl`）
-- 自身完整性哈希基线与签名指纹校验（`VerifySelfIntegrity` / `StoreHash`）
-
-核心检测与清除能力完整保留。
-
-## 协议
-
-[MIT](./LICENSE)
+MIT License

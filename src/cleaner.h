@@ -1,4 +1,4 @@
-// cleaner.h — 可疑文件清除（强制项）
+﻿// cleaner.h — 可疑文件清除（强制项）
 // 运行在 LocalSystem 服务进程内，因此天然具备「最高权限」：
 // 可结束任意会话/任意用户的进程、删除用户无权限删除的文件，**无需 UAC 提权**。
 #pragma once
@@ -49,7 +49,7 @@ std::vector<std::string> CollectCleanTargets();
 
 // ---- 清除进度（服务写 / 弹窗读）----
 // 弹窗运行在用户桌面会话，拿不到服务内存里的进度，故经
-// %ProgramData%\SilverFoxEnvScan\clean_progress.txt 传递，格式：
+// %ProgramData%\SilverFoxGuard\clean_progress.txt 传递，格式：
 //     phase=<locate|kill|delete|done> done=<已完成数> total=<总数> current=<当前目标路径>
 void WriteCleanProgress(const std::string& phase, int done, int total, const std::string& current);
 bool ReadCleanProgress(std::string& phase, int& done, int& total, std::string& current);

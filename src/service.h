@@ -1,4 +1,4 @@
-// service.h — 银狐环境检测服务（守护 / 安装 / 控制台）
+﻿// service.h — 银狐主防服务（守护 / 安装 / 控制台）
 #pragma once
 #include <windows.h>
 
@@ -14,7 +14,7 @@ bool SvcUninstall();
 // 查询后台服务是否已在运行（RUNNING / START_PENDING）
 bool IsServiceRunning();
 
-// 安装器（--install）：注册 NM 宿主 + 安装服务 + 启动
+// 安装器（--install）：注册 NM 宿主 + 安装服务 + 加固 + 记录哈希 + 启动
 bool DoInstall(const std::string& extIdChrome, const std::string& extIdEdge);
 bool DoUninstall();
 

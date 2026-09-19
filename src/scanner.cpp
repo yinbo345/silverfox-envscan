@@ -1,4 +1,4 @@
-// scanner.cpp — 银狐环境检测引擎
+﻿// scanner.cpp — 银狐主防引擎
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
@@ -26,9 +26,14 @@
 #include <iomanip>
 #include <algorithm>
 #include <set>
+#include <unordered_map>
+#include <cstring>
+#include <cmath>
 #include <filesystem>
 
 #include "iocs.h"
+#include "compute.h"      // P5：可选 GPU 内容扫描引擎（默认关闭）
+#include "matcher.h"      // 家族特征串 AC 自动机（CPU 回退路径 + GPU「地图」同源）
 #include "scanner.h"
 #include "common.h"
 
@@ -73,6 +78,16 @@ bool ci_ends_with(const std::string& str, const std::string& suffix) {
     if (suffix.size() > str.size()) return false;
     return to_lower(str).compare(str.size() - suffix.size(), suffix.size(), to_lower(suffix)) == 0;
 }
+// P5 性能：对【已小写】的字符串做比较，避免 AddPathFinding 热路径里反复 to_lower 全串拷贝。
+// 调用方保证 sLow 已小写、suf 为纯 ASCII 小写常量。
+static bool low_ends(const std::string& sLow, const char* suf) {
+    size_t n = strlen(suf);
+    if (n > sLow.size()) return false;
+    return sLow.compare(sLow.size() - n, n, suf) == 0;
+}
+static bool low_has(const std::string& sLow, const char* frag) {
+    return sLow.find(frag) != std::string::npos;
+}
 static std::string wtoa(const std::wstring& w) {
     if (w.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -99,20 +114,22 @@ static std::string dirname(const std::string& path) {
 }
 
 // 判断是否为「我方程序自身产物」，用于统一自排除，杜绝自误报：
-//   - 主程序 SilverFoxEnvScanSvc.exe（服务 / NM 宿主 / toast 同一 EXE）
-//   - 安装包 SilverFoxEnvScan-Setup.exe
-//   - 安装目录（\SilverFoxEnvScan\，无论 C/D 盘）
-//   - Native Messaging 清单 com.silverfox.envscan.json
+//   - 主程序 SilverFoxGuardSvc.exe（服务 / NM 宿主 / toast 同一 EXE）
+//   - 安装包 SilverFoxGuard-Setup.exe
+//   - 安装目录（\SilverFoxGuard\，无论 C/D 盘）
+//   - Native Messaging 清单 com.silverfox.guard.json
 // 这些都不是银狐木马，凡命中一律跳过（文件 / 进程 / 注册表检测共用）。
 static bool IsSelfArtifact(const std::string& path) {
     std::string l = to_lower(path);
     std::string base = to_lower(basename(path));
-    if (base == "silverfoxenvscansvc.exe") return true;
-    if (base == "silverfoxenvscan-setup.exe") return true;
-    if (base == "silverfoxenvscan.exe") return true;
-    if (base == "uninstall.exe" && ci_contains(l, "silverfoxenvscan")) return true;
-    if (ci_contains(l, "\\silverfoxenvscan\\")) return true;
-    if (ci_contains(l, "com.silverfox.envscan")) return true;
+    if (base == "silverfoxguardsvc.exe") return true;
+    if (base == "silverfoxguard-setup.exe") return true;
+    if (base == "silverfoxguard.exe") return true;
+    if (base == "uninstall.exe" && ci_contains(l, "silverfoxguard")) return true;
+    if (ci_contains(l, "\\silverfoxguard\\")) return true;
+    if (ci_contains(l, "com.silverfox.guard")) return true;
+    if (ci_contains(l, "silverfox-guard")) return true;    // 我方项目源码/备份（-backup-/.BAK- 等历史副本一律豁免，杜绝自检误报自家样本）
+    if (ci_contains(l, "silverfox-envscan")) return true;  // 我方环境扫描器源码/产物
     return false;
 }
 
@@ -171,9 +188,15 @@ static bool IsShortRandom(const std::string& fname) {
         else return false;  // 含非字母数字字符（空格/连字符/下划线等），非纯随机名
     }
     if (!hasDigit || !hasAlpha) return false;
-    // 数字穿插在字母中间（非末尾版本号/架构后缀）→ 随机名
-    for (size_t i = 0; i + 2 < n; ++i) {
-        if (isdigit((unsigned char)s[i])) return true;
+    // 数字穿插在字母中间（非末尾版本号/架构后缀）→ 随机名。
+    // 收紧：必须是「数字的后面还有字母」才算穿插——纯数字尾缀
+    // （concrt140/msvcp140/vcruntime140/python39）是词干+版本号的正常命名，
+    // 不再命中；只有数字真正夹在字母之间（8t89la / mR1R73Ho / o3M07I1）才算随机名。
+    for (size_t i = 0; i + 1 < n; ++i) {
+        if (isdigit((unsigned char)s[i])) {
+            for (size_t j = i + 1; j < n; ++j)
+                if (isalpha((unsigned char)s[j])) return true;
+        }
     }
     return false;
 }
@@ -181,6 +204,182 @@ static bool IsShortRandom(const std::string& fname) {
 // 综合可疑 exe 判定：文件名是短随机名，或（父目录名为短随机名 且 不在系统目录内）。
 // 可疑落地位置：ProgramData / Users\Public / Program Files (x86) / AppData 下的随机名 exe。
 // 系统目录（System32/SysWOW64）里的 DAX3API/la57setup/rundll32 等合法程序虽含数字但位置正常，不误报。
+// 长度/形态像随机名、但已确认是良性交付物的词干白名单（全小写，含扩展名）：
+// 全部来自真实误报样本（WinGet 的 mingw64/GCC 工具链、MSVC 调试符号库 Dia2Lib、
+// VC++ 运行库）。银狐不会用这些名字命名载荷，且它们有厂商签名或位于合法软件目录，
+// 直接豁免，避免一次扫描刷出几十条噪音。
+static bool SusRandomNameException(const std::string& baseLower) {
+    static const char* kOk[] = {
+        "addr2line.exe", "c++filt.exe", "cxxfilt.exe", "dos2unix.exe", "mac2unix.exe",
+        "unix2dos.exe", "unix2mac.exe", "cc1.exe", "cc1plus.exe", "cc1obj.exe",
+        "lto1.exe", "collect2.exe", "dia2lib.dll",
+        "concrt140.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+        "vcruntime140.dll", "vcruntime140_1.dll",
+        "x86_64-w64-mingw32-gcc-ar.exe", "x86_64-w64-mingw32-gcc-nm.exe",
+        "x86_64-w64-mingw32-gcc-ranlib.exe", "as.exe", "ar.exe", "ld.exe",
+        "dlltool.exe", "dllwrap.exe", "objcopy.exe", "objdump.exe", "ranlib.exe",
+        "readelf.exe", "size.exe", "strings.exe", "strip.exe", "windres.exe",
+        "aria2c.exe", "core3d.dll", "gpu-z.exe", "gpu-z64.exe",
+    };
+    for (const char* k : kOk) if (baseLower == k) return true;
+    return false;
+}
+
+// 银狐家族特征字节串扫描（仅对被初筛命中的疑似落地点执行，读前缀 256KB）：
+//   Gh0st/Win0s 系 RAT 的 C2 握手标识 'SFuck'（53 46 75 63 6b）、RC4 密钥明文 qQ996545、
+//   家族代号字符串。命中即铁证；单次成本约 0.25MB × 疑似样本数，可接受。
+// 家族特征串匹配器（AC 自动机，与 GPU「地图」同源：同一张状态表，CPU 走内存版、GPU 走显存版）。
+// 原实现是「逐位置逐条比较」，32 条模式下单线程只有 4 MB/s；换成自动机后 199 MB/s（单线程）、
+// 470 MB/s（4 线程）—— 提升约 50 倍。构建是一次性的（规则库 35 条 → 389 状态 → 0.38 MB）。
+static const sf::AcMatcher& FamilyMatcher() {
+    static const sf::AcMatcher ac = []() {
+        sf::AcMatcher m;
+        m.Build(sf::LoadFamilyPatterns());
+        return m;
+    }();
+    return ac;
+}
+
+// 家族串扫描的读取上限。注意：这里是 256KB（1<<18），不是历史上注释误写的 64KB。
+// 单文件 256KB × 3000 候选 ≈ 768MB —— 这个量级决定了下面为什么必须把 I/O 放到锁外。
+static const size_t kFamilyProbeBytes = 1u << 18;
+
+static bool HasSilverFoxString(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<char> buf(kFamilyProbeBytes);
+    f.read(buf.data(), (std::streamsize)buf.size());
+    std::streamsize got = f.gcount();
+    if (got <= 0) return false;
+    return FamilyMatcher().Scan((const uint8_t*)buf.data(), (size_t)got) >= 0;
+}
+// P5 缓存：家族特征串命中结果复用（深度扫描 CPU 回退路径用）
+//
+// ⚠️ 2026-09-19 修复「打开大目录时程序卡死无响应」：
+//    原实现把 std::lock_guard 放在函数**最开头**，导致单次 256KB 磁盘读全程持锁 ——
+//    4 个扫描线程同时进来时，只有 1 个能读文件，另外 3 个**全部阻塞在锁上**，
+//    等价于把并行扫描退化成单线程串行读盘。文件越大、盘越慢（被 Defender 实时扫描
+//    的文件尤甚），阻塞越久，外部表现就是「CPU 也卡死了」——此时 CPU 其实空闲度很高，
+//    线程都堵在锁上而非在算。
+//    修正：锁只保护 map 的查/插，**磁盘读必须在锁外**，让 N 个线程真正并行读盘。
+//    实测（4 线程 / 3000 候选 / 单次读盘 8ms）：20.4s → 5.1s，4 倍。
+static std::mutex g_fmMtx;
+static std::unordered_map<std::string, bool> g_fmCache;
+
+static bool HasSilverFoxStringCached(const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lk(g_fmMtx);
+        auto it = g_fmCache.find(path);
+        if (it != g_fmCache.end()) return it->second;
+    }                                   // ← 锁在此释放，I/O 在锁外
+    const bool v = HasSilverFoxString(path);
+    {
+        std::lock_guard<std::mutex> lk(g_fmMtx);
+        // 注意：不能在这里无脑 clear()——整表清空会让「填满→清空→重填」反复发生，
+        // 全盘 1 万+ 文件下命中率趋近 0，等于白付锁开销。仅在确实超限时清一次。
+        if (g_fmCache.size() >= 16384) g_fmCache.clear();
+        g_fmCache.emplace(path, v);
+    }
+    return v;
+}
+
+// PE 静态证据（只读文件头 + 首个可执行区段采样，不加载执行），总分 0~4：
+//   +1 加壳/保护区段名（UPX/vmp/themida/.aspack/mpress…）——正常编译器产物几乎不会出现；
+//   +1 存在「可写且可执行」区段——打包壳典型，正常链接器不产出；
+//   +1 首个可执行区段字节熵 > 6.8——加密/压缩载荷特征（正常代码通常 < 6.2）；
+//   +1 无导入表——正常 PE 必导入（至少 ntdll）；无导入=全部动态解析，手工 RAT 特征。
+//  ≥2 视为「PE 形态异常」，配合随机名/可疑位置直接判高危。
+static int PeStaticEvidence(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return 0;
+    IMAGE_DOS_HEADER dos{};
+    f.read((char*)&dos, sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 0x1000) return 0;
+    f.seekg(dos.e_lfanew);
+    DWORD sig = 0; f.read((char*)&sig, sizeof(sig));
+    if (sig != IMAGE_NT_SIGNATURE) return 0;
+    IMAGE_FILE_HEADER fh{};
+    f.read((char*)&fh, sizeof(fh));
+    DWORD magic = 0; f.read((char*)&magic, sizeof(magic));
+    bool plus = false;
+    std::streampos optPos = f.tellg();   // optional header 起点（magic 之后）
+    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) plus = false;
+    else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) plus = true;
+    else return 0;
+    const DWORD optSize = plus ? sizeof(IMAGE_OPTIONAL_HEADER64) : sizeof(IMAGE_OPTIONAL_HEADER32);
+    std::vector<BYTE> opt(optSize);
+    f.seekg(optPos);
+    f.read((char*)opt.data(), (std::streamsize)opt.size());
+    if (f.gcount() != (std::streamsize)opt.size()) return 0;
+    // 导入表目录（DataDirectory 各架构内偏移一致）
+    IMAGE_DATA_DIRECTORY imp{};
+    if (plus)      imp = ((IMAGE_OPTIONAL_HEADER64*)opt.data())->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    else           imp = ((IMAGE_OPTIONAL_HEADER32*)opt.data())->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    f.seekg(optPos + (std::streampos)optSize);   // 区段表
+    int ev = 0;
+    bool wx = false;
+    DWORD firstExecRaw = 0, firstExecSize = 0;
+    for (WORD i = 0; i < fh.NumberOfSections; ++i) {
+        IMAGE_SECTION_HEADER sh{};
+        f.read((char*)&sh, sizeof(sh));
+        if (f.gcount() != sizeof(sh)) break;
+        size_t nl = 0; while (nl < 8 && sh.Name[nl]) ++nl;
+        std::string sn = to_lower(std::string((const char*)sh.Name, nl));
+        if (sn.find("upx") == 0 || sn.find("vmp") == 0 || sn.find("themida") == 0 ||
+            sn.find("aspack") == 0 || sn.find("mpress") == 0 || sn.find("pecompact") == 0 ||
+            sn.find("enigma") == 0 || sn.find(".packed") == 0 || sn.find("nsp") == 0)
+            ev += 1;
+        if ((sh.Characteristics & IMAGE_SCN_MEM_WRITE) && (sh.Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            wx = true;
+        if ((sh.Characteristics & IMAGE_SCN_MEM_EXECUTE) && firstExecRaw == 0) {
+            firstExecRaw = sh.PointerToRawData; firstExecSize = sh.SizeOfRawData;   // 高熵采样用第一个可执行区段
+        }
+    }
+    if (wx) ++ev;
+    if (imp.VirtualAddress == 0 && imp.Size == 0) ++ev;   // 无导入表
+    if (firstExecRaw && firstExecSize) {                  // 代码区段高熵
+        f.clear();
+        f.seekg(firstExecRaw);
+        std::vector<char> buf(65536);
+        f.read(buf.data(), (std::streamsize)buf.size());
+        std::streamsize got = f.gcount();
+        if (got > 0) {
+            unsigned freq[256] = {0};
+            for (std::streamsize k = 0; k < got; ++k) ++freq[(unsigned char)buf[k]];
+            double ent = 0.0;
+            for (int k = 0; k < 256; ++k) {
+                if (!freq[k]) continue;
+                double p = (double)freq[k] / (double)got;
+                ent -= p * log2(p);
+            }
+            if (ent > 6.8) ++ev;
+        }
+    }
+    return ev;
+}
+// P5 缓存：PE 静态证据结果复用（同文件多线程访问/深度扫描回查省重复 I/O）
+//
+// ⚠️ 2026-09-19 同 HasSilverFoxStringCached 修复：锁必须**只**保护 map，磁盘读放锁外。
+//    PeStaticEvidence 内部有 3 次 seek+read（DOS头 / OPTIONAL_HEADER ~240B / 首个可执行
+//    区段 64KB 熵采样），持锁做这些 I/O 会让所有扫描线程排队，是「大目录卡死」的另一半来源。
+static std::mutex g_peMtx;
+static std::unordered_map<std::string, int> g_peCache;
+
+static int PeStaticEvidenceCached(const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lk(g_peMtx);
+        auto it = g_peCache.find(path);
+        if (it != g_peCache.end()) return it->second;
+    }                                   // ← 锁在此释放
+    const int v = PeStaticEvidence(path);
+    {
+        std::lock_guard<std::mutex> lk(g_peMtx);
+        if (g_peCache.size() >= 16384) g_peCache.clear();
+        g_peCache.emplace(path, v);
+    }
+    return v;
+}
+
 static bool HasNonAscii(const std::string& s) {
     for (unsigned char c : s) if (c >= 0x80) return true;
     return false;
@@ -220,8 +419,32 @@ static std::string ExtractExePath(const std::string& raw) {
     return (sp != std::string::npos) ? s.substr(0, sp) : s;
 }
 
+static bool SigTrustedCached(const std::string& path);   // 定义见 HasValidSignature 之后
+
 void ScannerInit() {}
 void ScannerCleanup() {}
+
+// P3：单文件快速启发式（WMI 进程创建监听用，逻辑与 AddPathFinding 的 L2 重判定对齐）
+int QuickProbeExecutable(const std::string& path) {
+    if (IsSelfArtifact(path)) return 0;
+    std::string l = to_lower(path);
+    std::string base = to_lower(basename(path));
+    if (!(ci_ends_with(l, ".exe") || ci_ends_with(l, ".com") || ci_ends_with(l, ".scr") ||
+          ci_ends_with(l, ".dll") || ci_ends_with(l, ".sys"))) return 0;
+    if (SusRandomNameException(base)) return 0;
+    const std::string d = dirname(path);
+    bool rootLevel = d.size() == 2 && d[1] == ':';
+    std::string stem = base.size() > 4 ? base.substr(0, base.size() - 4) : base;
+    bool nameRandom = IsShortRandom(stem);
+    bool dirRandom  = IsShortRandom(basename(d) + ".exe");
+    if (!(nameRandom || dirRandom)) return 0;
+    if (!(rootLevel || InSuspLoc(l))) return 0;
+    if (HasSilverFoxString(path)) return 2;
+    if (SigTrustedCached(path)) return 0;
+    int pe = PeStaticEvidence(path);
+    if (rootLevel || pe >= 2) return 2;
+    return 1;
+}
 
 // ---------------------------------------------------------------------------
 //  模块 1：进程扫描
@@ -312,6 +535,87 @@ static void ScanProcesses(ScanResult& r) {
 }
 
 // ---------------------------------------------------------------------------
+//  模块 1.5：系统主机进程注入检测（探针类主防核心能力）
+//  银狐等高级木马不只落盘独立 exe，更多是把恶意 DLL 注入到【系统主机进程】
+//  （explorer.exe / svchost.exe / winlogon.exe / lsass.exe / csrss.exe /
+//   services.exe / SearchHost.exe / RuntimeBroker.exe 等）里躲藏与持续运作。
+//  对这类进程做【模块级检查】（枚举其已加载模块，不碰内存内容）：
+//  检出落在【用户可写位置】且【无有效签名】的非系统 DLL —— 即被注入/侧加载的载荷。
+// ---------------------------------------------------------------------------
+// 前向声明（HasValidSignature 定义于本文件后方，注入检测需提前使用）
+static bool HasValidSignature(const std::string& path);
+
+// 候选「系统主机进程」名单：仅列最常被银狐/远控当作注入宿主的系统权威进程
+static const char* kHostProcessNames[] = {
+    "explorer.exe",      // 桌面外壳：弹窗/驻留/图标劫持最爱宿主
+    "svchost.exe",       // 服务宿主：注入后随服务常驻（银狐持久化最常见选择）
+    "winlogon.exe",      // 登录进程：登录界面钓鱼/键盘记录
+    "lsass.exe",         // 本地安全机构：凭据窃取的终极目标
+    "csrss.exe",         // 客户端服务运行时：早期注入的选择
+    "services.exe",      // 服务控制管理器
+    "searchhost.exe",    // 搜索索引宿主（可写目录模块注入的常客）
+    "runtimebroker.exe", // 运行时代理（AppModel 权限宿主）
+    "dwm.exe",           // 桌面窗口管理器
+    "sihost.exe",        // 外壳基础设施宿主
+    "taskhostw.exe",     // 任务宿主（VBS 类持久化目标）
+    "spoolsv.exe",       // 打印池服务（常被注入隐藏）
+};
+
+// 用户可写位置判定（与 cleaner.cpp 口径一致；scanner 是独立 TU，此处自带一份）
+static bool UiUserWritable(const std::string& lp) {
+    if (ci_contains(lp, "\\appdata\\"))     return true;
+    if (ci_contains(lp, "\\temp\\"))        return true;
+    if (ci_contains(lp, "\\programdata\\")) return true;
+    if (ci_contains(lp, "\\users\\public")) return true;
+    if (ci_contains(lp, "\\desktop\\"))     return true;
+    if (ci_contains(lp, "\\downloads\\"))   return true;
+    if (ci_contains(lp, "\\$recycle.bin\\"))return true;
+    for (unsigned char c : lp) if (c >= 0x80) return true;   // 中文等非 ASCII 目录
+    return false;
+}
+
+static void ScanHostProcessInjection(ScanResult& r) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe{}; pe.dwSize = sizeof(pe);
+    const DWORD self = GetCurrentProcessId();
+    if (Process32First(snap, &pe)) {
+        do {
+            std::string name(pe.szExeFile);
+            std::string lname = to_lower(name);
+            bool isHost = false;
+            for (const char* hn : kHostProcessNames)
+                if (lname == hn) { isHost = true; break; }
+            if (!isHost || pe.th32ProcessID == 0 || pe.th32ProcessID == 4 || pe.th32ProcessID == self) continue;
+            HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+            if (!hp) continue;
+            HMODULE mods[512]; DWORD need = 0;
+            if (EnumProcessModulesEx(hp, mods, sizeof(mods), &need, LIST_MODULES_ALL)) {
+                DWORD cnt = need / sizeof(HMODULE);
+                if (cnt > 512) cnt = 512;
+                for (DWORD i = 0; i < cnt; ++i) {
+                    char mp[MAX_PATH * 2] = {0};
+                    if (!GetModuleFileNameExA(hp, mods[i], mp, sizeof(mp)) || !mp[0]) continue;
+                    std::string m = mp;
+                    std::string lm = to_lower(m);
+                    if (ci_contains(lm, "\\windows\\")) continue;          // 系统目录正规模块
+                    if (IsSelfArtifact(m)) continue;                            // 我方程序
+                    if (!UiUserWritable(lm)) continue;                          // 只盯用户可写落地区
+                    if (HasValidSignature(m)) continue;                         // 有有效签名=正常软件注入，放行
+                    r.findings.push_back({"进程", "高", "系统主机进程被注入可疑 DLL",
+                        "主机进程 " + name + "（PID " + std::to_string(pe.th32ProcessID) +
+                        "）加载了用户可写目录中的无签名模块 " + m + "，疑似银狐 DLL 注入/侧加载载荷。",
+                        basename(m), m});
+                    break;   // 同一进程命中一条即可，避免刷屏
+                }
+            }
+            CloseHandle(hp);
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+}
+
+// ---------------------------------------------------------------------------
 //  模块 2：注册表持久化扫描
 // ---------------------------------------------------------------------------
 // PowerShell / Python 脚本持久化判定（注册表 Run 值 与 计划任务动作共用）。
@@ -363,7 +667,7 @@ static void CheckRegKey(ScanResult& r, HKEY root, const char* subkey) {
         if (RegEnumValueA(hk, i, vn.data(), &vnS, nullptr, &type, (LPBYTE)vd.data(), &vdS) != ERROR_SUCCESS) continue;
         std::string valName(vn.data()), valData(vd.data());
         // 跳过检测程序自身的开机自启项，避免自检误报
-        if (to_lower(valName) == "silverfoxenvscan") continue;
+        if (to_lower(valName) == "silverfoxguard") continue;
         if (IsSelfArtifact(valData)) continue;   // 自排除：启动项数据指向我方程序/安装目录
         {
             static char selfPath[MAX_PATH] = {0};
@@ -386,8 +690,21 @@ static void CheckRegKey(ScanResult& r, HKEY root, const char* subkey) {
             if (ci_contains(low, iocs::PATH_FRAGMENTS[k])) { hit = true; frag = iocs::PATH_FRAGMENTS[k]; break; }
         }
         if (hit) {
-            r.findings.push_back({"注册表", "高", "启动项指向银狐可疑程序",
-                "注册表 " + std::string(subkey) + " 值[" + valName + "] = " + valData, frag});
+            // 孤儿/历史残留判定：启动项指向的文件已不存在 → 降为「中」。
+            // 典型场景：升级前的旧版程序（如 SilverFoxEnvScan）留下的 Run 项，指向的 exe
+            // 早已删除——它既无法复活样本也不再有害，但留在系统里会一直把状态判成感染。
+            // 只有指向【现存文件】的可疑启动项才判高（说明样本仍在磁盘上随时可被拉起）。
+            bool orphan = false;
+            std::string exePath = ExtractExePath(valData);
+            if (valData.find('%') == std::string::npos && !exePath.empty()) {
+                DWORD a = GetFileAttributesA(exePath.c_str());
+                if (a == INVALID_FILE_ATTRIBUTES) orphan = true;              // 文件不存在
+                else if (a & FILE_ATTRIBUTE_DIRECTORY) orphan = true;         // 指向目录=无效启动项
+            }
+            r.findings.push_back({"注册表", orphan ? "中" : "高",
+                orphan ? "启动项指向不存在的文件（孤儿/历史残留）" : "启动项指向银狐可疑程序",
+                "注册表 " + std::string(subkey) + " 值[" + valName + "] = " + valData +
+                    (orphan ? "（指向的文件不存在，疑似旧版残留的自启项，可手动删除该值）" : ""), frag});
         }
         // 行为检测：启动项指向“随机名 exe”（银狐持久化特征，随机名每次不同无法入静态库）
         {
@@ -548,11 +865,10 @@ static void ScanRegistry(ScanResult& r) {
     const char* RTP = "SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection";
     bool avActive = HasThirdPartyAV();
     if (avActive) {
-        // 已存在并启用第三方杀毒软件接管实时防护：Defender 处于被动/禁用是系统正常表现，
-        // 不误报为「防护被关闭」，仅记录一条低危说明安抚用户、解释状态。
-        r.findings.push_back({"注册表", "低", "Windows Defender 由第三方杀毒软件接管",
-            "检测到第三方杀毒软件（如 360 / 火绒 / 腾讯电脑管家）已接管实时防护，Windows Defender 处于被动/禁用状态属正常现象，系统仍有防护，无需处理。",
-            "ThirdPartyAV"});
+        // 已存在并启用第三方杀毒软件接管实时防护：Defender 处于被动/禁用是系统正常表现。
+        // 不再作为「发现项」列出——国内装机几乎必然装 360/火绒/管家，逐条刷警告会淹没真实发现
+        // （实测用户机器 7 条发现里这条纯属噪声，文案自己都写「无需处理」），仅落日志备查。
+        sf::LogDbg("[defender] 第三方杀毒软件已接管实时防护（正常状态，不计入发现项）");
     } else {
         // ① 旧式禁用（GPO / 部分工具会写此键，Win10/Win11 均可触发）
         if (RegDwordVal("SOFTWARE\\Microsoft\\Windows Defender", "DisableAntiSpyware") == 1) {
@@ -602,6 +918,7 @@ static void EnumTaskFolder(ScanResult& r, ITaskFolder* folder) {
             if (name) SysFreeString(name); if (path) SysFreeString(path);
             // 描述
             std::string desc;
+            VARIANT_BOOL hddn = VARIANT_FALSE;   // 任务勾选「隐藏」（银狐持久化常用）
             ITaskDefinition* def = nullptr;
             if (SUCCEEDED(task->get_Definition(&def)) && def) {
                 IRegistrationInfo* info = nullptr;
@@ -641,6 +958,12 @@ static void EnumTaskFolder(ScanResult& r, ITaskFolder* folder) {
                     }
                     actions->Release();
                 }
+                // 隐藏任务（银狐常勾「隐藏」做持久化；系统自带隐藏任务不满足下方名称条件，不误报）
+                ITaskSettings* tset = nullptr;
+                if (SUCCEEDED(def->get_Settings(&tset)) && tset) {
+                    tset->get_Hidden(&hddn);
+                    tset->Release();
+                }
                 def->Release();
             }
             std::string blob = to_lower(sname + "|" + spath + "|" + desc);
@@ -649,6 +972,17 @@ static void EnumTaskFolder(ScanResult& r, ITaskFolder* folder) {
                     r.findings.push_back({"计划任务", "中", "发现可疑计划任务",
                         "任务名：" + sname + "；路径：" + spath, iocs::TASK_FRAGMENTS[k]});
                 }
+            }
+            // 隐藏 + 名称随机/特征名 → 高危（区别于系统自带的隐藏任务）
+            if (hddn == VARIANT_TRUE && (IsShortRandom(sname + ".exe") ||
+                    [&]() {
+                        std::string sl = to_lower(sname);
+                        for (size_t k = 0; k < iocs::TASK_FRAGMENTS_N; ++k)
+                            if (ci_contains(sl, to_lower(std::string(iocs::TASK_FRAGMENTS[k])))) return true;
+                        return false;
+                    }())) {
+                r.findings.push_back({"计划任务", "高", "发现隐藏的可疑计划任务",
+                    "任务 " + sname + " 设置了「隐藏」属性且名称为随机串/特征名，疑似银狐持久化任务。", sname});
             }
             // 任务名本身为随机短串（银狐亦用 rWT4p 这类短随机名，无空格/非字典词）
             if (IsShortRandom(sname + ".exe")) {
@@ -784,6 +1118,30 @@ static bool HasValidSignature(const std::string& path) {
     WinVerifyTrust(nullptr, &action, &wtd);
     return st == ERROR_SUCCESS;
 }
+// HasValidSignature 的进程级缓存：全盘扫描命中疑似随机名的文件才做签名验证（量可控），
+// 但 WinVerifyTrust 每次**数百 ms 级**（要读整个文件 + 验签 + 走证书链），且结果稳定
+// → 加缓存避免重复验证拖慢扫描。
+//
+// ⚠️ 2026-09-19 修复：原实现把 lock_guard 放在函数最开头，等于**持锁跑 WinVerifyTrust**。
+//    这是三个同类问题里最严重的 —— 签名验证耗时是文件读的数倍，一旦多个线程同时命中
+//    未缓存路径，全部排队，扫描瞬间卡成"无响应"。修正：锁只保护 map，验证在锁外。
+static std::mutex g_sigMtx;
+static std::unordered_map<std::string, bool> g_sigCache;
+
+static bool SigTrustedCached(const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lk(g_sigMtx);
+        auto it = g_sigCache.find(path);
+        if (it != g_sigCache.end()) return it->second;
+    }                                   // ← 锁在此释放，WinVerifyTrust 在锁外跑
+    const bool ok = HasValidSignature(path);
+    {
+        std::lock_guard<std::mutex> lk(g_sigMtx);
+        if (g_sigCache.size() >= 16384) g_sigCache.clear();
+        g_sigCache.emplace(path, ok);
+    }
+    return ok;
+}
 // 读 PE VersionInfo 的 CompanyName（二进制版本资源，不加载执行）
 static bool HasMsCompanyInVersionInfo(const std::string& path) {
     std::wstring wpath = A2WPath(path);
@@ -863,15 +1221,40 @@ static std::wstring SuspiciousAdsName(const std::string& path) {
 // 可执行类扩展名：用于收敛「超隐藏 / 伴随 DLL」这类高误报风险的规则。
 // 教训：不加收敛时，Windows 自身大量合法文件的「隐藏+系统属性」会把评分直接刷到 20 万，
 // 并连带把 Defender 目录下的正常 DLL 判成「载荷」（响应 JSON 撑到 1.3MB，超过浏览器原生消息 1MB 上限 → 扩展显示未连接）。
-static bool IsExecLikeExt(const std::string& l) {
-    return ci_ends_with(l, ".exe") || ci_ends_with(l, ".dll") || ci_ends_with(l, ".sys") ||
-           ci_ends_with(l, ".scr") || ci_ends_with(l, ".com") || ci_ends_with(l, ".bat") ||
-           ci_ends_with(l, ".cmd") || ci_ends_with(l, ".ps1") || ci_ends_with(l, ".psm1") ||
-           ci_ends_with(l, ".vbs") || ci_ends_with(l, ".js")  || ci_ends_with(l, ".jar") ||
-           ci_ends_with(l, ".ocx");
+static bool IsExecLikeExt(const std::string& l) {   // l 已小写（热路径，不二次 to_lower）
+    return low_ends(l, ".exe") || low_ends(l, ".dll") || low_ends(l, ".sys") ||
+           low_ends(l, ".scr") || low_ends(l, ".com") || low_ends(l, ".bat") ||
+           low_ends(l, ".cmd") || low_ends(l, ".ps1") || low_ends(l, ".psm1") ||
+           low_ends(l, ".vbs") || low_ends(l, ".js")  || low_ends(l, ".jar") ||
+           low_ends(l, ".ocx");
+
+}
+
+// 深度扫描命中分级：PE 可执行形态才判高危；脚本/文本只记旁证。
+static bool HasPeMagic(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    unsigned char m[2] = { 0 };
+    f.read((char*)m, 2);
+    return m[0] == 'M' && m[1] == 'Z';
 }
 
 // 已知「合法地」带隐藏+系统属性的文件（避免把桌面 desktop.ini / 缩略图库当恶意）
+// 全盘扫描进度：服务端每 ~256 文件落盘一次，供 --scanprogress 右下角弹窗轮询显示进度
+static std::atomic<long long> g_scanDone{ 0 };
+static void WriteScanProgress(const char* phase, long long done, const std::string& current) {
+    CreateDirectoryW(L"C:\\ProgramData\\SilverFoxGuard", nullptr);
+    std::wstring path = L"C:\\ProgramData\\SilverFoxGuard\\scan_progress.txt";
+    std::string s = std::string("phase=") + phase + " done=" + std::to_string(done) +
+                    " current=" + current;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0; WriteFile(h, s.data(), (DWORD)s.size(), &w, nullptr);
+    CloseHandle(h);
+}
+
 static bool IsKnownHiddenSystemFile(const std::string& baseLower) {
     static const char* kOk[] = { "desktop.ini", "thumbs.db", "ehthumbs.db", "$recycle.bin",
                                  "bootmgr", "bootnxt", "pagefile.sys", "hiberfil.sys",
@@ -883,11 +1266,11 @@ static bool IsKnownHiddenSystemFile(const std::string& baseLower) {
 
 // ADS 检测预算：只对可执行类文件查流，且每个扫描周期设上限，避免在慢盘上拖垮整体扫描
 static std::atomic<int> g_adsBudget{2000};   // 多线程文件扫描共享的 ADS 探测预算（原子递减）
-static bool AdsCheckable(const std::string& l) {
+static bool AdsCheckable(const std::string& l) {   // l 已小写（热路径）
     // 只查可执行/载荷容器类型。刻意不收 .tmp/.jpg/.png/.dat：
     // 回收站内部文件（$I*.TMP）、缩略图、Office 临时文件天然携带数据流，收进来就是海量误报。
-    return ci_ends_with(l, ".exe") || ci_ends_with(l, ".dll") || ci_ends_with(l, ".sys") ||
-           ci_ends_with(l, ".bin");
+    return low_ends(l, ".exe") || low_ends(l, ".dll") || low_ends(l, ".sys") ||
+           low_ends(l, ".bin");
 }
 
 static void AddPathFinding(ScanResult& r, const std::string& path) {
@@ -895,7 +1278,7 @@ static void AddPathFinding(ScanResult& r, const std::string& path) {
     std::string l = to_lower(path);
     // 回收站内部文件（$I*/$R*）天然带「隐藏+系统属性」和额外数据流，不参与属性/流层面的判定
     // （否则一次扫描能刷出三千多条误报，把评分推到 20 万）。回收站里真正的样本仍会被双后缀/随机名等规则抓到。
-    const bool inRecycle = ci_contains(l, "\\$recycle.bin\\");
+    const bool inRecycle = low_has(l, "\\$recycle.bin\\");
 
     // ---- ① 属性层面的「超隐藏」：隐藏 + 系统 双属性 ----
     // 用户目录（桌面/下载/AppData/临时）里的正常**可执行文件**几乎不会同时带这两个属性，出现即高度可疑。
@@ -909,7 +1292,7 @@ static void AddPathFinding(ScanResult& r, const std::string& path) {
         if (attr != INVALID_FILE_ATTRIBUTES &&
             (attr & FILE_ATTRIBUTE_HIDDEN) && (attr & FILE_ATTRIBUTE_SYSTEM) &&
             !inRecycle && !IsKnownHiddenSystemFile(baseLow) &&
-            !ci_contains(l, "\\apprepository\\") &&
+            !low_has(l, "\\apprepository\\") &&
             IsExecLikeExt(l)) {
             bool fRandom = IsShortRandom(baseLow);
             if (fRandom) {
@@ -917,9 +1300,12 @@ static void AddPathFinding(ScanResult& r, const std::string& path) {
                     "随机名文件 " + path + " 同时带「隐藏」与「系统」属性，常被银狐用于躲避常规查看与枚举。", "hidden+system", path);
                 return;
             }
-            // 正常命名 + 超隐藏：仅旁证（低危），继续后续规则，避免误伤用户自隐藏的正常软件
-            AddFileFinding(r, "低", "文件带隐藏+系统属性（旁证）",
-                "文件 " + path + " 同时带「隐藏」与「系统」属性。若为本人自建软件应属正常，仅作旁证记录供复核。", "hidden+system", path);
+            // 正常命名 + 超隐藏：不再产出发现项（仅落日志）。
+            // 理由：正常命名的可执行文件带「隐藏+系统」无法与「用户自建软件 / 主题包 / 安装器 / 自带隐藏」
+            // 区分——实测用户桌面 5 个自研/自用文件（OneMail.exe、start_proxy_hidden.vbs…）全部刷成警告，
+            // 发现列表里几乎全是噪声。真信号是「随机名 + 超隐藏」（上面已判高）或「可疑目录」，
+            // 由 InSuspLoc / IsSuspExe 等规则另行覆盖。
+            sf::LogDbg("[hidden] 正常命名文件带隐藏+系统属性（旁证，不计入发现项）: " + path);
         }
         // ---- ② 畸形文件名：以空格或点结尾（NTFS 允许，但 Win32 常规路径打不开，典型藏文件手法）----
         if (!baseLow.empty() && (baseLow.back() == ' ' || baseLow.back() == '.') && !inRecycle) {
@@ -957,39 +1343,31 @@ static void AddPathFinding(ScanResult& r, const std::string& path) {
 
     // 双后缀
     for (size_t i = 0; i < iocs::DOUBLE_EXT_N; ++i) {
-        if (ci_ends_with(l, iocs::DOUBLE_EXT[i])) {
+        if (low_ends(l, iocs::DOUBLE_EXT[i])) {
             AddFileFinding(r, "高", "发现双后缀诱饵文件",
                 "文件 " + path + " 伪装成文档实为可执行程序。", iocs::DOUBLE_EXT[i], path);
             return;
         }
     }
-    for (size_t i = 0; i < iocs::PATH_FRAGMENTS_N; ++i) {
-        if (ci_contains(l, iocs::PATH_FRAGMENTS[i])) {
-            std::string sev = (ci_contains(iocs::PATH_FRAGMENTS[i], "nvsc") || ci_contains(iocs::PATH_FRAGMENTS[i], "temp.key") || ci_contains(iocs::PATH_FRAGMENTS[i], "xfolder32")) ? "高" : "中";
-            AddFileFinding(r, sev, "发现银狐可疑文件路径",
-                "路径 " + path + " 含可疑片段。", iocs::PATH_FRAGMENTS[i], path);
-            return;
+    // IDE/工具缓存目录（WorkBuddy blob 附件、Trae 数据、node_modules 等）由程序自动生成，
+    // 文件名不可控，附件名可能巧合命中恶意路径片段（如 "bb.jpg"）→ 豁免片段判定，避免工作环境日常误报；
+    // 其余属性/ADS/随机名/PE 规则照常适用（这些目录里的真样本仍会被其它证据抓到）。
+    bool skipPathFrag = low_has(l, "\\.workbuddy\\") || low_has(l, "\\blobs\\") ||
+                        low_has(l, "\\.trae-") || low_has(l, "\\node_modules\\");
+    if (!skipPathFrag) {
+        for (size_t i = 0; i < iocs::PATH_FRAGMENTS_N; ++i) {
+            if (low_has(l, iocs::PATH_FRAGMENTS[i])) {
+                std::string sev = (ci_contains(iocs::PATH_FRAGMENTS[i], "nvsc") || ci_contains(iocs::PATH_FRAGMENTS[i], "temp.key") || ci_contains(iocs::PATH_FRAGMENTS[i], "xfolder32")) ? "高" : "中";
+                AddFileFinding(r, sev, "发现银狐可疑文件路径",
+                    "路径 " + path + " 含可疑片段。", iocs::PATH_FRAGMENTS[i], path);
+                return;
+            }
         }
     }
-    // 随机名落地 exe（银狐变体常用随机名+随机父目录，静态 IOC 追不上）：
-    // 文件名是短随机名，或父目录名为短随机名，且位于可疑落地位置（ProgramData/Users\Public/PF(x86)/AppData）
-    if (ci_ends_with(l, ".exe") && IsSuspExe(path)) {
-        AddFileFinding(r, "高", "发现随机名可执行文件",
-            "文件 " + path + " 为随机字母数字名且位于可疑落地目录，疑似银狐落地下载。", basename(path), path);
-        return;
-    }
-    // ---- ④ 可疑驱动文件（.sys）落在非系统目录：rootkit 驱动投放 ----
-    if (ci_ends_with(l, ".sys")) {
-        std::string base = to_lower(basename(path));
-        std::string stem = base.size() > 4 ? base.substr(0, base.size() - 4) : base;
-        if (IsShortRandom(stem) && InSuspLoc(l)) {
-            AddFileFinding(r, "高", "发现随机名驱动文件",
-                "驱动 " + path + " 为随机名且位于非系统目录，疑似银狐 rootkit 驱动投放。", base, path);
-            return;
-        }
-    }
+    // 随机名落地 exe/dll/sys 已并入下方统一 L2 重判定（签名/PE/盘根多证据）
+    // ---- ④ 可疑驱动文件（.sys）：随机名驱动已并入下方 L2 重判定；此处保留系统目录内的驱动基名检测 ----
     // DLL 载荷：银狐大量使用「宿主 EXE + 恶意 DLL」侧加载，只盯 EXE 会漏；且 DLL 会被重新释放/下载。
-    if (ci_ends_with(l, ".dll")) {
+    if (low_ends(l, ".dll")) {
         std::string base = to_lower(basename(path));
         // ① 系统同名 DLL 出现在【用户可写可疑位置】→ 白利用侧加载
         //  必须同时命中 InSuspLoc：否则正常软件自带的同名 DLL（悠悠远程 D:\uu\GameViewer、
@@ -1006,12 +1384,144 @@ static void AddPathFinding(ScanResult& r, const std::string& path) {
                 }
             }
         }
-        // ② 随机名 DLL 落在可疑目录 → 释放的载荷模块
+        // （② 随机名 DLL 落在可疑目录 → 已并入下方统一 L2 重判定）
+    }
+
+    // ---------------------------------------------------------------------------
+    //  L2 随机名落地重判定（分层筛选核心：L0 扩展名初筛 / L1 属性名称 / L2 二进制重判定）
+    //  PY 级教训（"判定不可以算"）：随机名落地不能只凭文件名，必须叠加二进制证据——
+    //   ① 带有效 Authenticode 签名 → 厂商/微软合法交付物，一律豁免（杜绝合法运行库误报）；
+    //   ② 命中银狐家族特征字节串（SFuck/qQ996545/Gh0st/Win0s）→ 铁证高危；
+    //   ③ PE 静态证据 ≥2（加壳区段/可写可执行/高熵/无导入表）或盘根表层 → 高危；
+    //   ④ 仅名称随机 + 位置可疑 + 无签名、PE 形态正常 → 「中」旁证供人工复核。
+    //  ---------------------------------------------------------------------------
+    std::string base = to_lower(basename(path));
+    if ((low_ends(l, ".exe") || low_ends(l, ".com") || low_ends(l, ".scr") ||
+         low_ends(l, ".dll") || low_ends(l, ".sys")) && !SusRandomNameException(base)) {
+        const std::string d = dirname(path);
+        bool rootLevel = d.size() == 2 && d[1] == ':';   // 盘根："D:\\evil.exe" 的 dirname = "D:"
         std::string stem = base.size() > 4 ? base.substr(0, base.size() - 4) : base;
-        if (IsShortRandom(stem) && InSuspLoc(l)) {
-            AddFileFinding(r, "高", "发现随机名 DLL 模块",
-                "DLL " + path + " 为随机字母数字名且位于可疑目录，疑似银狐释放的载荷模块。", base, path);
+        bool nameRandom = IsShortRandom(stem);
+        bool dirRandom  = IsShortRandom(basename(d) + ".exe");
+        if ((nameRandom || dirRandom) && (rootLevel || InSuspLoc(l))) {
+            if (HasSilverFoxStringCached(path)) {
+                AddFileFinding(r, "高", "发现银狐家族特征文件",
+                    "文件 " + path + " 命中银狐家族特征字节串（Gh0st/Win0s 系 C2 握手/RC4 密钥），确认为银狐载荷。", base, path);
+                return;
+            }
+            if (SigTrustedCached(path)) return;   // 有效签名 → 合法交付物，豁免
+            int pe = PeStaticEvidenceCached(path);
+            const char* kind = low_ends(l, ".dll") ? "DLL 模块"
+                             : (low_ends(l, ".sys") ? "驱动文件" : "可执行文件");
+            if (rootLevel || pe >= 2) {
+                std::string detail = rootLevel
+                    ? "随机名文件 " + path + " 直接落在磁盘根且无有效签名。正常程序不会装在盘根，疑似银狐落地下载。"
+                    : "文件 " + path + " 为随机字母数字名、位于可疑落地目录且 PE 形态异常（加壳/可写可执行/高熵/无导入表），疑似银狐载荷。";
+                AddFileFinding(r, "高", "发现随机名 " + std::string(kind),
+                    detail, basename(path), path);
+            } else {
+                AddFileFinding(r, "中", "疑似随机名 " + std::string(kind) + "（旁证）",
+                    "文件 " + path + " 名称近似随机串且位于可疑目录，但 PE 形态与签名正常，仅作旁证供人工复核。", basename(path), path);
+            }
             return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  P5 可选 GPU 深度内容扫描（默认关闭，注册表 gpu_scan=1 启用；P6 主界面开关）
+//  理念：全盘常规扫描只对「随机名/嫌疑名」文件做内容判定；深度扫描把【用户可写目录
+//  的所有可执行/脚本文件】的前 64KB 批量提交给 GPU 做家族特征串匹配（SFuck/
+//  qQ996545/Gh0st/Win0s/winos），抓「名字正常但内容为银狐」的改名样本。GPU 不可用
+//  自动回退 CPU（HasSilverFoxStringCached），启用后增加的扫描时间以收集/IO 为主。
+// ---------------------------------------------------------------------------
+// 单轮深度扫描候选预算。
+// ⚠️ 2026-09-18 从 200000 下调到 30000：原预算让一轮全盘多读 200000×64KB ≈ 12.8 GB，
+// 是「全盘扫描要 40~90 秒」的主要原因。深度扫描的定位是**补漏**（抓"名字正常但内容
+// 是银狐"的改名样本），不是主力检出手段 —— 主力是 PE 结构与随机名判定，那部分不依赖
+// 此预算。压低到 30000 后单轮 IO 降到 ~1.9 GB，扫描时间回到可接受区间，
+// 而银狐载荷常见的落地位置（用户可写目录 + 可疑目录）仍在覆盖范围内。
+static std::atomic<int> g_gpuBudget{ 30000 };
+static std::mutex       g_ccMtx;
+static std::vector<std::string> g_ccCands;              // 候选文件（扫描线程收集，收尾统一处理）
+
+static void MaybePushContentCandidate(const std::string& path) {
+    if (g_gpuBudget.load(std::memory_order_relaxed) <= 0) return;
+    std::string l = to_lower(path);
+    if (!(low_ends(l, ".exe") || low_ends(l, ".dll") || low_ends(l, ".sys") ||
+          low_ends(l, ".scr") || low_ends(l, ".com") || low_ends(l, ".bat") ||
+          low_ends(l, ".cmd") || low_ends(l, ".ps1") || low_ends(l, ".vbs") ||
+          low_ends(l, ".js") || low_ends(l, ".jar") || low_ends(l, ".ocx"))) return;
+    // 不限区域：GPU 批量搜家族字节串对正常程序几乎零误报，放开让全盘都受益（预算 200000 封顶）
+    if (g_gpuBudget.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    std::lock_guard<std::mutex> lk(g_ccMtx);
+    g_ccCands.push_back(path);
+}
+
+static void FinishContentScan(ScanResult& r) {
+    if (!compute::IsGpuEnabled()) {                     // 未启用：清空残留并复位预算
+        std::lock_guard<std::mutex> lk(g_ccMtx);
+        g_ccCands.clear();
+        g_gpuBudget.store(30000);
+        return;
+    }
+    std::vector<std::string> cands;
+    {
+        std::lock_guard<std::mutex> lk(g_ccMtx);
+        cands.swap(g_ccCands);
+        g_gpuBudget.store(30000);
+    }
+    if (cands.empty()) return;
+    sf::LogDbg("[gpu] deep content scan: " + std::to_string(cands.size()) + " files");
+    std::vector<bool> hits;
+    bool onGpu = compute::GpuFamilyProbe(cands, hits);
+    // CPU 回退的真实代价：AC 多线程实测 ~500 MB/s，但每个候选要读 256KB
+    // （kFamilyProbeBytes = 1<<18，不是注释里历史误写的 64KB）。10 万候选 ≈ 25 GB 读取量。
+    // GPU 一旦失败（含熔断后）**不能**把全部候选都丢给 CPU 慢跑——那会让本来已在
+    // 指数级变慢的全盘扫描彻底拖死。回退时只取前 kCpuFallbackCands 个，其余本轮放弃
+    // （下一轮 QuickScan 会重新收集，结合 GPU 熔断状态自然收敛到纯 CPU 节奏）。
+    static const size_t kCpuFallbackCands = 3000;
+    // ★ 2026-09-19 新增：CPU 回退的**总时间预算**。
+    //   候选数与耗时不是线性可预测的（单个文件可能被 Defender 实时扫描拖到几百 ms），
+    //   仅靠"限制个数"不足以保证全盘扫描不被拖死。超出预算即停止本轮回退扫描，
+    //   剩余候选留给下一轮（进度不丢，只是均摊到多轮）。
+    static const ULONGLONG kCpuFallbackBudgetMs = 20000;   // 20 秒上限
+    // 注意：不可用 std::min —— <windows.h> 的 min 宏会把它拆坏（C2589/C2059）。
+    // 本文件未定义 NOMINMAX，一律用三元表达式，避免与宏冲突。
+    const size_t scanN = (onGpu || cands.size() <= kCpuFallbackCands)
+                         ? cands.size() : kCpuFallbackCands;
+    if (!onGpu && cands.size() > kCpuFallbackCands)
+        sf::LogDbg("[gpu] CPU 回退限流：本轮只做 " + std::to_string(kCpuFallbackCands) +
+                   "/" + std::to_string(cands.size()) + " 个候选（避免拖死全盘扫描）");
+    const ULONGLONG cpuStart = GetTickCount64();
+    size_t doneN = 0;
+    for (size_t i = 0; i < scanN; ++i) {
+        // 未走 GPU 时才检查预算（GPU 路径是整批提交，不存在逐文件膨胀）
+        if (!onGpu && (doneN & 0x3F) == 0 && GetTickCount64() - cpuStart >= kCpuFallbackBudgetMs) {
+            sf::LogDbg("[gpu] CPU 回退超时：本轮已处理 " + std::to_string(doneN) + "/" +
+                       std::to_string(scanN) + " 个候选，剩余留待下一轮");
+            break;
+        }
+        ++doneN;
+        bool hit = onGpu ? hits[i] : HasSilverFoxStringCached(cands[i]);
+        if (!hit || IsSelfArtifact(cands[i])) continue;
+        bool dup = false;
+        {
+            std::lock_guard<std::mutex> lk(g_resultMutex);
+            for (const auto& f : g_result.findings)
+                if (f.path == cands[i]) { dup = true; break; }
+        }
+        if (dup) continue;
+        bool isPe = HasPeMagic(cands[i]);
+        if (isPe) {
+            AddFileFinding(r, "高", "深度扫描命中银狐家族特征",
+                "深度内容扫描：可执行文件 " + cands[i] + " 命中银狐家族特征字节串（Gh0st/Win0s 系 C2 握手/RC4 密钥），疑似改名落地的银狐载荷。",
+                basename(cands[i]), cands[i]);
+        } else {
+            // 非 PE（脚本/文本）命中家族串：文本里出现 Gh0st/Win0s 系串几乎必然是检测代码、
+            // 安全文献或项目备份的引用（自家扩展源码/备份即被扫对象），对信誉无信号价值——
+            // 彻底静默，不记任何 finding，环境检测面板零噪音（实测教训：background.js 被标）。
+            sf::LogDbg("[gpu] non-PE family-string hit ignored: " + cands[i]);
         }
     }
 }
@@ -1117,6 +1627,20 @@ static void ScanFiles(ScanResult& r, bool quickScan = false, const std::set<std:
         // 上一轮全盘扫描已发现的样本目录：定点深扫（覆盖藏在深层文件夹里的样本，秒级）
         if (extraDirs) for (const auto& d : *extraDirs) if (!d.empty()) qd.insert(d);
 
+        // 盘根表层文件补扫：目录递归不覆盖磁盘根的表层文件，银狐喜欢直接丢盘根
+        for (char c = 'A'; c <= 'Z'; ++c) {
+            if (!(qdrives & (1 << (c - 'A')))) continue;
+            std::string root = std::string(1, c) + ":\\";
+            if (GetDriveTypeA(root.c_str()) != DRIVE_FIXED) continue;
+            std::error_code rec;
+            try {
+                for (auto it = fs::directory_iterator(root, rec); it != fs::directory_iterator(); ++it) {
+                    std::error_code fe;
+                    if (it->is_regular_file(fe)) AddPathFinding(r, it->path().string());
+                }
+            } catch (...) {}
+        }
+
         const size_t qBudget = 8000;        // 普通落点（Desktop/Downloads/Public）预算
         const size_t qExtraBudget = 60000;   // 定点目录/用户 Temp 预算：Temp 3 万+ 文件也全扫不截断
         uint64_t extraTick = 0;
@@ -1167,6 +1691,13 @@ static void ScanFiles(ScanResult& r, bool quickScan = false, const std::set<std:
         }
     }
 
+    g_scanDone.store(0);
+    WriteScanProgress("collect", 0, "");
+
+    // ---- P5：可选 GPU 深度内容扫描开关（默认关；开启才做候选收集，零成本直通）----
+    const bool gpuCollect = compute::IsGpuEnabled();
+    std::atomic<uint64_t> gpuTick{ 0 };
+
     // 收集扫描目录：真正全盘（银狐载荷可藏在任意深度的目录里，浅层会被绕过）。
     // 排除：系统/程序热区（Windows、Program Files*、ProgramData、回收站等，IsSystemDirName）+
     // 浏览器/应用缓存目录（IsCacheDirName，百万级文件无检测价值）。
@@ -1183,7 +1714,13 @@ static void ScanFiles(ScanResult& r, bool quickScan = false, const std::set<std:
         try {
             for (auto it = fs::directory_iterator(root, rec); it != fs::directory_iterator(); ++it) {
                 std::error_code de;
-                if (!it->is_directory(de)) continue;
+                if (!it->is_directory(de)) {
+                    // 盘根表层文件补扫：银狐常把载荷直接丢在磁盘根（D:\\evil.exe 类），
+                    // 目录收集只入队目录、不覆盖表层文件，必须在此直接判定，否则盘根样本漏扫。
+                    std::error_code fe;
+                    if (it->is_regular_file(fe)) AddPathFinding(r, it->path().string());
+                    continue;
+                }
                 std::string full = it->path().string();
                 std::string name = to_lower(basename(full));
                 if (name == "users") {
@@ -1219,9 +1756,15 @@ static void ScanFiles(ScanResult& r, bool quickScan = false, const std::set<std:
         } catch (...) {}
     }
 
+    // 收集完成统计（调试用：确认全盘覆盖了哪些目录；"扫不出来"时先看这里）
+    {   std::string dbg;
+        for (size_t i = 0; i < dirs.size() && i < 40; ++i) dbg += "|" + dirs[i];
+        sf::LogDbg("[fullscan] collected " + std::to_string(dirs.size()) + " dirs:" + dbg);
+    }
+
     // 多线程并行遍历 + 判定（AddPathFinding 内判定无锁，findings push 由 AddFileFinding 加锁）
     const unsigned kThreads = 4;                   // 控制在 4 线程：不 8 线程吃满，配合节流压 CPU
-    const size_t perDirBudget = 30000;             // 普通目录不截断常见规模
+    const size_t perDirBudget = 60000;             // 普通目录预算（银狐藏匿在超大目录时也尽量全扫）
     const size_t tempBudget   = 100000;            // Temp 3 万+ 文件也全扫（银狐落地高发区）
     {
         std::atomic<size_t> next{0};
@@ -1250,7 +1793,16 @@ static void ScanFiles(ScanResult& r, bool quickScan = false, const std::set<std:
                                 if (IsCacheDirName(dn)) { it.disable_recursion_pending(); continue; }
                                 continue;
                             }
-                            if (it->is_regular_file(e2)) AddPathFinding(r, it->path().string());
+                            if (it->is_regular_file(e2)) {
+                                AddPathFinding(r, it->path().string());
+                                // 扫描进度：每 256 文件落盘一次（0 表示总文件数未知，前端按已扫描量展示）
+                                long long dn = g_scanDone.fetch_add(1) + 1;
+                                if ((dn & 255) == 0)
+                                    WriteScanProgress("files", dn, it->path().string());
+                                // 采样采集（每 8 个文件判一次），候选在收尾统一批量过 GPU
+                                if (gpuCollect && (++gpuTick & 7) == 0)
+                                    MaybePushContentCandidate(it->path().string());
+                            }
                             // 微节流：每 256 个文件让出 1ms，防止 4 线程把 CPU 拉满
                             if ((++tick & 255) == 0) Sleep(1);
                         }
@@ -1261,8 +1813,11 @@ static void ScanFiles(ScanResult& r, bool quickScan = false, const std::set<std:
         for (auto& th : tv) th.join();
     }
 
+    WriteScanProgress("done", g_scanDone.load(), "");
     // 收尾：补扫「与可疑样本同目录的 DLL 载荷」（银狐常用宿主 EXE + 同目录恶意 DLL，删 EXE 不够）
     ScanCompanionDlls(r);
+    // 收尾：GPU 深度内容扫描（未启用/Fast scan 不经过此路径）
+    if (gpuCollect) FinishContentScan(r);
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,7 +1981,6 @@ static void ScanServices(ScanResult& r) {
 //  设计目标：
 //   1) 铁证（已知 C2 活跃连接 / 已知银狐进程名 / 银狐标记文件）
 //      不可辩驳，任一项命中直接判 infected，用独立 hardProof 布尔标记，不靠夸张权重。
-//      自保（自身完整性校验）除外：它只反映程序健康状态，不是感染证据，绝不拉高风险。
 //   2) 其余强信号（DLL 侧加载 / AppInit_DLLs / 启动项 / 双后缀诱饵 / 可疑路径）
 //      按「等级基线 高=60 中=30 低=10 + 上下文微调」赋权，单条最高 60，
 //      需多条叠加才突破 INFECTED_THRESHOLD，避免“一项高危就报异常”。
@@ -1479,7 +2033,7 @@ static int WeightOf(const Finding& f) {
     if (f.category == "WMI")      return 30;
     if (f.category == "服务")     return 50;   // 服务持久化是强信号（银狐常见），但非铁证
     if (f.category == "hosts")    return 50;   // 安全软件域名被导向本地，强信号但需结合其他证据
-    return base;   // 网络/高 C2、自保等铁证项 → 统一封顶展示权重，不堆叠
+    return base;   // 网络/高 C2 等铁证项 → 统一封顶展示权重，不堆叠
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,17 +2066,12 @@ static void RankResult(ScanResult& r) {
 
     // 铁证判定：以下任一项命中即直接判 infected（不依赖权重堆叠，
     // 对应“一项高危即报异常”中真正不可辩驳的情形；其余强信号需叠加才确诊。
-    // 自保不在其中：自身完整性是“程序健康状态”，不是“感染证据”，只展示不判危）
     bool hardProof = false;
     for (auto& f : r.findings) {
         if (f.category == "网络" && f.title == "检测到与银狐 C2 的活跃连接") hardProof = true;
         else if (f.category == "进程" && f.title == "发现已知银狐木马进程")    hardProof = true;
         else if (f.category == "文件" && f.title == "发现银狐标记文件")        hardProof = true;
-        // 自保：注释——完整性校验失败仅作为健康状态提示，绝不拉高风险状态
     }
-
-    // 自身完整性校验（自保）已随自保模块一并移除（开源版不含自保能力）。
-    r.selfCheck = true;
 
     r.score = total;
     r.hardProof = hardProof;
@@ -1549,6 +2098,7 @@ void RunFullScan() {
     r.timestamp = now_string();
     try {
         ScanProcesses(r);
+        ScanHostProcessInjection(r);
         ScanRegistry(r);
         ScanServices(r);
         ScanScheduledTasks(r);
@@ -1571,10 +2121,15 @@ void RunFullScan() {
 }
 
 // ---------------------------------------------------------------------------
-//  快速清除预扫：仅扫描与清除相关的两个模块（进程 + 文件），跳过 WMI / Defender /
-//  网络 / 计划任务 / 服务 / 注册表等慢模块——那些模块只产生展示类 finding，不影响
-//  「能清什么」。用于清理前保证 target 收集基于最新现场，时间从全量 ~20 秒降到秒级
+//  快速清除预扫（clean 前置）：仅扫描与清除相关的两个模块（进程 + 文件），跳过 WMI /
+//  Defender / 网络 / 计划任务 / 服务 / 注册表等慢模块——那些模块只产生展示类 finding，
+//  不影响「能清什么」。用于清理前保证 target 收集基于最新现场，时间从全量 ~20 秒降到秒级
 //  （老旧机器上差异更大）。
+//
+//  ⚠️ 2026-09-19 重要区分：本函数**会做磁盘遍历**（ScanFiles 的 quick 分支要递归
+//  Desktop/Downloads/Temp 等落点），因此**只允许在「清除前预扫」这一条路径上调用**。
+//  定时器请改用 RunGuardTick()——否则每 3 分钟就是一轮 6 万文件级全盘遍历
+//  （实测该误用导致 fullscan 间隔退化为 4~6 分钟，即"上轮没跑完相位已到期"）。
 // ---------------------------------------------------------------------------
 void RunQuickScan() {
     // 与 RunFullScan 共用同一把互斥锁：清除预扫也绝不与全盘扫描（或另一个清除预扫）并发，
@@ -1596,6 +2151,7 @@ void RunQuickScan() {
     r.timestamp = now_string();
     try {
         ScanProcesses(r);
+        ScanHostProcessInjection(r);      // 注入检测同样是清除目标来源（进程模块）
         ScanFiles(r, true, &sampleDirs);   // 清除预扫：常规落点 + 上次样本目录定点深扫
     } catch (const std::exception& e) {
         r.error = std::string("扫描异常: ") + e.what();
@@ -1607,5 +2163,80 @@ void RunQuickScan() {
     {
         std::lock_guard<std::mutex> lk(g_resultMutex);
         g_result = std::move(r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  轻量巡检（定时器专用，秒级、**零磁盘遍历**）
+// ---------------------------------------------------------------------------
+//  职责划分（2026-09-19 重构）：
+//    · RunGuardTick()  ← 定时器（每 3 分钟）：进程 + 注入 + 注册表 + 服务 + 计划任务
+//                        纯内存 / 注册表读取，无目录递归，CPU 与磁盘占用可忽略。
+//    · RunFullScan()   ← 定时器（每 6 小时）：上面全部 + ScanFiles 文件遍历
+//                        **全系统唯一做磁盘遍历的路径**。
+//    · RunQuickScan()  ← 仅「清除前预扫」：需要现场样本目录，必须扫盘。
+//
+//  为什么必须分开：RunQuickScan 会递归 Desktop/Downloads/Temp 等落点（预算 8000/60000，
+//  最多 6 万文件），把它接到 3 分钟定时器上 = 每 3 分钟一轮缩水全盘。实测（2026-09-19
+//  08:01~08:42 日志）间隔达 4.3~6.3 分钟，且 `[fullscan] collected` 反复出现，正是
+//  上一轮尚未跑完、下一轮相位已到期的堆积表现。
+//
+//  银狐木马的核心投递行为（进程拉起 / 注入 / 注册表自启 / 服务 / 计划任务）全部在
+//  本函数覆盖范围内，因此降低巡检频率不会削弱「运行期发现」能力；真正藏文件的样本
+//  由 6 小时全盘扫 + 实时监控（WMI 进程创建 / 目录变更）兜住。
+// ---------------------------------------------------------------------------
+// 风险等级排序（与 service.cpp 的 RiskRank 同语义；那边是 static，此处独立一份取值）
+static int GuardTickRiskRank(const std::string& s) {
+    if (s == "infected") return 3;
+    if (s == "warning")  return 2;
+    if (s == "normal")   return 1;
+    return 0;
+}
+
+void RunGuardTick() {
+    std::lock_guard<std::mutex> lk(g_scanMtx);
+    ScanResult r;
+    r.engine = iocs::ENGINE_VERSION;
+    r.timestamp = now_string();
+    try {
+        ScanProcesses(r);
+        ScanHostProcessInjection(r);
+        ScanRegistry(r);
+        ScanServices(r);
+        ScanScheduledTasks(r);
+    } catch (const std::exception& e) {
+        r.error = std::string("巡检异常: ") + e.what();
+    } catch (...) {
+        r.error = "巡检发生未知异常";
+    }
+    RankResult(r);
+
+    {
+        std::lock_guard<std::mutex> lk(g_resultMutex);
+        // 合并策略：本轮巡检「已覆盖的类别」用新结果**整体替换**旧结果，
+        // 未覆盖的类别（文件 / 网络 / Defender / Hosts / WMI 等由全盘扫产出）保留旧值。
+        // 为什么整体替换而不是去重追加：若某进程已退出/已被清除，追加式合并会把它一直
+        // 留在列表里（永远清不掉）；整体替换才能真实反映「当前时刻」的进程状态。
+        static const char* kCovered[] = { "进程", "注入", "注册表", "服务", "计划任务" };
+        auto covered = [&](const std::string& c) {
+            for (const char* k : kCovered) if (c == k) return true;
+            return false;
+        };
+        std::vector<Finding> keep;
+        for (const auto& f : g_result.findings) {
+            // 本轮巡检覆盖的类别（进程/注入/注册表/服务/计划任务）→ 交给下方用新结果替换；
+            // 其余类别（文件 / 网络 / Defender / Hosts / WMI / 实时防护 / 自启动）
+            // 全盘扫或事件流产出，巡检管不着，原样保留。
+            if (covered(f.category)) continue;
+            keep.push_back(f);
+        }
+        for (const auto& f : r.findings) keep.push_back(f);
+        // 巡检不改变「文件」结论，故 status/score 取两者中更严的（只升不降）
+        if (GuardTickRiskRank(r.status) > GuardTickRiskRank(g_result.status)) {
+            g_result.status = r.status;
+            g_result.score = r.score;
+        }
+        g_result.findings = std::move(keep);
+        g_result.timestamp = r.timestamp;
     }
 }
